@@ -214,6 +214,22 @@ def init_db():
 
     cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 
+    # محفظة حساب "يوزرات الدفع من قبلي": شحن (رصيدك) / خصم (جملة كل يوزر) / استلام (لما يرجّعلك)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS self_wallet (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            notes TEXT,
+            activation_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # وقت ما رجّع المشترك فلوس "من قبلي" (فارغ = بعده ما مسدد إلك)
+    if not column_exists(cur, "activations", "self_collected_at"):
+        cur.execute("ALTER TABLE activations ADD COLUMN self_collected_at TEXT")
+
     # سعر البيع عند "من قبلي" لكل باقة
     if not column_exists(cur, "plans", "self_price"):
         cur.execute("ALTER TABLE plans ADD COLUMN self_price INTEGER")
@@ -300,14 +316,41 @@ DEBT_SALE_SUBQUERY = """
     SELECT COALESCE(SUM(a.retail_price), 0) FROM activations a
     WHERE a.subscriber_id = s.id AND a.payment_type = 'دين'
 """
-# المسدد من قبلي لهذا المشترك = مجموع أسعار التفعيلات "من قبلي"
+# المبلغ الي بذمة المشترك إلك (دفعته عنه "من قبلي" وبعده ما رجّعه)
 SELF_SUBQUERY = """
     SELECT COALESCE(SUM(a.retail_price), 0) FROM activations a
-    WHERE a.subscriber_id = s.id AND a.payment_type = 'من قبلي'
+    WHERE a.subscriber_id = s.id AND a.payment_type = 'من قبلي' AND a.self_collected_at IS NULL
 """
 
 
 PREV_OP = "اشتراك سابق"
+
+SW_TOPUP, SW_OUT, SW_BACK, SW_WITHDRAW = "شحن", "خصم", "استلام", "سحب"
+
+
+def self_wallet_balance(con):
+    return con.execute("""
+        SELECT COALESCE(SUM(CASE WHEN kind IN ('شحن', 'استلام') THEN amount ELSE -amount END), 0) AS b
+        FROM self_wallet
+    """).fetchone()["b"]
+
+
+def self_wallet_on_self(con, activation_id):
+    """لما تتحول عملية لـ"من قبلي": ينخصم سعر جملتها من محفظة حساب الدفع من قبلي."""
+    op = con.execute("""
+        SELECT a.amount, s.username, p.name AS plan_name FROM activations a
+        JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id WHERE a.id = ?
+    """, (activation_id,)).fetchone()
+    if not op or con.execute("SELECT 1 FROM self_wallet WHERE activation_id = ? AND kind = 'خصم'",
+                             (activation_id,)).fetchone():
+        return
+    con.execute("INSERT INTO self_wallet (kind, amount, notes, activation_id, created_at) VALUES ('خصم', ?, ?, ?, ?)",
+                (op["amount"], f"{op['username']} - {op['plan_name']}", activation_id, now_str()))
+
+
+def self_wallet_clear(con, activation_id, kinds=("خصم", "استلام")):
+    con.execute(f"DELETE FROM self_wallet WHERE activation_id = ? AND kind IN ({','.join('?' * len(kinds))})",
+                (activation_id, *kinds))
 
 
 def record_previous(con, subscriber_id, plan_id, start, retail, payment_type, wholesale=None, notes=""):
@@ -331,6 +374,8 @@ def record_previous(con, subscriber_id, plan_id, start, retail, payment_type, wh
     """, (subscriber_id, plan_id, PREV_OP, wholesale, retail, retail - wholesale, payment_type,
           retail if payment_type == PAY_CASH else 0,
           None if payment_type == PAY_DEBT else when, notes, when))
+    if payment_type == PAY_SELF:
+        self_wallet_on_self(con, con.execute("SELECT last_insert_rowid()").fetchone()[0])
     con.execute("""
         UPDATE subscribers SET plan_id = ?, activation_date = ?, expiry_date = ?
         WHERE id = ? AND (activation_date IS NULL OR activation_date <= ?)
@@ -771,7 +816,7 @@ BASE_HTML = """
 {% set titles = {
     'dashboard': 'الرئيسية', 'subscribers': 'المشتركون', 'subscriber_detail': 'تفاصيل المشترك',
     'wallet': 'المحفظة', 'plans': 'الباقات والأسعار', 'reports': 'التقارير',
-    'settings': 'الإعدادات', 'debts': 'الديون ومسددين من قبلي', 'settle_operation': 'ترحيل', 'import_users': 'استيراد اليوزرات', 'wa_import': 'تفعيلات واتساب', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل'
+    'settings': 'الإعدادات', 'debts': 'الديون', 'self_account': 'الدفع من قبلي', 'settle_operation': 'ترحيل', 'import_users': 'استيراد اليوزرات', 'wa_import': 'تفعيلات واتساب', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل'
 } %}
 {% set ep = request.endpoint %}
 
@@ -783,6 +828,7 @@ BASE_HTML = """
             <a href="{{ url_for('dashboard') }}" class="{{ 'active' if ep == 'dashboard' }}"><i class="bi bi-grid-1x2"></i> الرئيسية</a>
             <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer','import_users','wa_import'] }}"><i class="bi bi-people"></i> المشتركون</a>
             <a href="{{ url_for('debts') }}" class="{{ 'active' if ep == 'debts' }}"><i class="bi bi-journal-text"></i> الديون</a>
+            <a href="{{ url_for('self_account') }}" class="{{ 'active' if ep == 'self_account' }}"><i class="bi bi-piggy-bank"></i> يوزرات الدفع من قبلي</a>
             <a href="{{ url_for('wallet') }}" class="{{ 'active' if ep == 'wallet' }}"><i class="bi bi-wallet2"></i> المحفظة</a>
             <a href="{{ url_for('plans') }}" class="{{ 'active' if ep == 'plans' }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
             <a href="{{ url_for('reports') }}" class="{{ 'active' if ep == 'reports' }}"><i class="bi bi-bar-chart-line"></i> التقارير</a>
@@ -826,12 +872,13 @@ BASE_HTML = """
     <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer'] }}"><i class="bi bi-people{{ '-fill' if ep in ['subscribers','subscriber_detail','activate','transfer'] }}"></i>المشتركون</a>
     <a href="{{ url_for('wallet') }}" class="{{ 'active' if ep == 'wallet' }}"><i class="bi bi-wallet{{ '-fill' if ep == 'wallet' else '2' }}"></i>المحفظة</a>
     <a href="{{ url_for('debts') }}" class="{{ 'active' if ep == 'debts' }}"><i class="bi bi-journal-text"></i>الديون</a>
-    <button data-bs-toggle="offcanvas" data-bs-target="#more" class="{{ 'active' if ep in ['plans','settings','reports'] }}"><i class="bi bi-three-dots"></i>المزيد</button>
+    <button data-bs-toggle="offcanvas" data-bs-target="#more" class="{{ 'active' if ep in ['plans','settings','reports','self_account','wa_import'] }}"><i class="bi bi-three-dots"></i>المزيد</button>
 </nav>
 
 <div class="offcanvas offcanvas-bottom" tabindex="-1" id="more" style="height:auto;border-radius:22px 22px 0 0;background:var(--card)">
     <div class="offcanvas-body nav-side pb-4">
         <div class="who mb-2"><span class="avatar">{{ (session.get('username') or '?')[:1]|upper }}</span> {{ session.get('username') }}</div>
+        <a href="{{ url_for('self_account') }}"><i class="bi bi-piggy-bank"></i> يوزرات الدفع من قبلي</a>
         <a href="{{ url_for('wa_import') }}"><i class="bi bi-whatsapp"></i> تفعيلات من واتساب الشركة</a>
         <a href="{{ url_for('reports') }}"><i class="bi bi-bar-chart-line"></i> التقارير</a>
         <a href="{{ url_for('plans') }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
@@ -1062,6 +1109,9 @@ def dashboard():
     balance = wallet_balance(con)
     shop = get_setting(con, "shop_name")
     since, last_charge = collection_since_charge(con)
+    selfacc = self_account_totals(con)
+    selfacc_m = self_account_totals(con, since=month_start)
+    sw_bal = self_wallet_balance(con)
     con.close()
 
     expiring_rows = "".join(f"""
@@ -1104,8 +1154,9 @@ def dashboard():
                   f"من النقد فقط — الإجمالي: {money(total['profit'])} د.ع"),
         stat_card("مجموع مبالغ الاشتراكات", f"{money(month['collected'])} د.ع", "bi-collection", "#7c3aed",
                   f"هذا الشهر — الإجمالي: {money(total['collected'])}"),
-        stat_card("مسددين من قبلي", f"{money(total['self'])} د.ع", "bi-piggy-bank", "#0ea5e9",
-                  f"{total['self_n']} عملية — بدون أرباح", url_for("debts")),
+        stat_card("يوزرات الدفع من قبلي", f"{money(selfacc['unpaid'])} د.ع", "bi-piggy-bank", "#0ea5e9",
+                  f"بذمتهم إلك ({selfacc['unpaid_subs']} مشترك) — رصيد الحساب {money(sw_bal)} — ربح الشهر {money(selfacc_m['profit'])}",
+                  url_for("self_account")),
         stat_card("الديون", f"{money(total['debt'])} د.ع", "bi-journal-text", "#ef4444",
                   f"على {total['debt_n']} مشترك", url_for("debts")),
     ])
@@ -1335,13 +1386,12 @@ def delete_form(subscriber_id, label=True, cls="btn-sm"):
 
 
 def account_badges(debt, self_paid):
-    """شارات حساب المشترك: دين / من قبلي."""
-    out = []
-    if debt:
-        out.append(f'<span class="badge bg-danger">دين {money(debt)}</span>')
+    """شارات حساب المشترك بالحساب الرئيسي: دين، أو مسدد (والي دافع عنه "من قبلي" يبين جنبه)."""
+    out = [f'<span class="badge bg-danger">دين {money(debt)}</span>' if debt
+           else '<span class="badge bg-success-subtle text-success-emphasis">مسدد</span>']
     if self_paid:
-        out.append(f'<span class="badge bg-info text-dark">من قبلي {money(self_paid)}</span>')
-    return " ".join(out) or '<span class="badge bg-success-subtle text-success-emphasis">مسدد</span>'
+        out.append(f'<span class="badge bg-info text-dark" title="بذمته إلك بحساب الدفع من قبلي">من قبلي {money(self_paid)}</span>')
+    return " ".join(out)
 
 
 def pay_choice_html(selected=PAY_CASH, prefix=""):
@@ -1407,8 +1457,8 @@ PAY_CALC_JS = """
             out.innerHTML = '📒 يُضاف <b class="text-danger">' + fmt(wholesale) +
                 ' د.ع</b> (سعر الجملة) لحساب الديون — الربح ينحسب لما تستلم المبلغ (ترحيل)';
         } else {
-            out.innerHTML = '🐷 من قبلي: يُضاف <b>' + fmt(price) +
-                ' د.ع</b> لتحصيل المبالغ ولقائمة مسددين من قبلي — <b>بدون أرباح</b>';
+            out.innerHTML = '🐷 من قبلي: مسدد بالحساب الرئيسي، ويُضاف <b>' + fmt(price) +
+                ' د.ع</b> لتحصيل المبالغ — وينتقل لحساب يوزرات الدفع من قبلي (ربحه ينحسب هناك لما يرجّعلك المبلغ)';
         }
     }
     document.querySelectorAll('form.pay-form').forEach(payCalc);
@@ -1579,7 +1629,7 @@ def subscribers():
                     <option value="active" {"selected" if status == "active" else ""}>فعّال</option>
                     <option value="expired" {"selected" if status == "expired" else ""}>منتهي</option>
                     <option value="debt" {"selected" if status == "debt" else ""}>عليه دين</option>
-                    <option value="self" {"selected" if status == "self" else ""}>مدفوع من قبلي</option>
+                    <option value="self" {"selected" if status == "self" else ""}>من قبلي (بذمته إلك)</option>
                 </select>
                 <select name="plan" class="form-select" style="max-width:180px">
                     <option value="">كل الباقات</option>{plan_filter_opts}
@@ -1669,6 +1719,32 @@ def get_subscriber(con, subscriber_id):
     """, (subscriber_id,)).fetchone()
 
 
+def self_status(h):
+    if h["payment_type"] != PAY_SELF:
+        return ""
+    if h["self_collected_at"]:
+        return ' <small class="text-success">✓ رجّعه إلك</small>'
+    return ' <small class="text-info">بذمته إلك</small>'
+
+
+def op_action(h, subscriber_id):
+    """زر العملية بصفحة المشترك: ترحيل للدين، استلمت لـ"من قبلي"، تعديل للباقي."""
+    if h["payment_type"] == PAY_DEBT:
+        return f'<a href="{url_for("settle_operation", op_id=h["id"])}" class="btn btn-sm btn-warning">ترحيل</a>'
+    if h["payment_type"] == PAY_SELF and not h["self_collected_at"]:
+        return f"""<div class="d-flex gap-1">
+            <form method="post" action="{url_for('self_collect')}">
+                <input type="hidden" name="op_id" value="{h['id']}">
+                <input type="hidden" name="back" value="{url_for('subscriber_detail', subscriber_id=subscriber_id)}">
+                <button class="btn btn-sm btn-success">استلمت</button></form>
+            <a href="{url_for('settle_operation', op_id=h['id'])}" class="btn btn-sm btn-outline-secondary">تعديل</a></div>"""
+    if h["payment_type"] == PAY_SELF:
+        return f"""<form method="post" action="{url_for('self_uncollect')}" data-confirm="ترجّعها غير مسددة؟">
+            <input type="hidden" name="op_id" value="{h['id']}">
+            <button class="btn btn-sm btn-outline-secondary">تراجع</button></form>"""
+    return f'<a href="{url_for("settle_operation", op_id=h["id"])}" class="btn btn-sm btn-outline-secondary">تعديل</a>'
+
+
 @app.route("/subscribers/<int:subscriber_id>", methods=["GET", "POST"])
 @login_required
 def subscriber_detail(subscriber_id):
@@ -1738,11 +1814,10 @@ def subscriber_detail(subscriber_id):
             <td>{esc(h['plan_name'])}</td>
             <td>{money(h['retail_price'])}</td>
             <td>{money(h['amount'])}</td>
-            <td>{payment_badge(h['payment_type'])}</td>
-            <td>{money(h['profit']) if h['payment_type'] == PAY_CASH else '—'}</td>
+            <td>{payment_badge(h['payment_type'])}{self_status(h)}</td>
+            <td>{money(h['profit']) if h['payment_type'] == PAY_CASH or h['self_collected_at'] else '—'}</td>
             <td>{esc(h['operation_date'])}</td>
-            <td><a href="{url_for('settle_operation', op_id=h['id'])}" class="btn btn-sm {'btn-warning' if h['payment_type'] != PAY_CASH else 'btn-outline-secondary'}">
-                {'ترحيل' if h['payment_type'] != PAY_CASH else 'تعديل'}</a></td>
+            <td>{op_action(h, subscriber_id)}</td>
         </tr>""" for h in history) or '<tr><td colspan="8" class="text-muted text-center">لا توجد عمليات لهذا المشترك</td></tr>'
 
     body = f"""
@@ -1762,8 +1837,8 @@ def subscriber_detail(subscriber_id):
             <small class="text-muted">ينتهي: {esc(s['expiry_date'])}</small></div></div>
         <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>دين عليه</h6>
             <h4 class="fw-bold {'text-danger' if debt else 'text-success'}">{money(debt)} د.ع</h4></div></div>
-        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>مدفوع من قبلي</h6>
-            <h4 class="fw-bold text-info">{money(self_paid)} د.ع</h4></div></div>
+        <div class="col-6 col-md-3"><a href="{url_for('self_account')}" class="text-decoration-none"><div class="card stat-card p-3"><h6>بذمته إلك (من قبلي)</h6>
+            <h4 class="fw-bold text-info">{money(self_paid)} د.ع</h4></div></a></div>
         <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>المحصّل / الربح</h6>
             <h4 class="fw-bold">{money(collected)}</h4><small class="text-success">ربح {money(profit)} د.ع</small></div></div>
     </div>
@@ -1878,6 +1953,8 @@ def delete_subscriber(subscriber_id):
         flash("المشترك غير موجود", "danger")
         return redirect(url_for("subscribers"))
     con.execute("DELETE FROM debts WHERE subscriber_id = ?", (subscriber_id,))
+    con.execute("DELETE FROM self_wallet WHERE activation_id IN (SELECT id FROM activations WHERE subscriber_id = ?)",
+                (subscriber_id,))
     con.execute("DELETE FROM activations WHERE subscriber_id = ?", (subscriber_id,))
     con.execute("DELETE FROM subscribers WHERE id = ?", (subscriber_id,))
     con.commit()
@@ -1956,6 +2033,8 @@ def perform_activation(subscriber_id):
           retail if payment_type == PAY_CASH else 0,
           None if payment_type == PAY_DEBT else precise_now(), notes, now))
     activation_id = cur.lastrowid
+    if payment_type == PAY_SELF:
+        self_wallet_on_self(con, activation_id)
 
     con.execute("""
         UPDATE subscribers
@@ -1970,7 +2049,7 @@ def perform_activation(subscriber_id):
     msg = (f"تم تفعيل {subscriber['username']} لغاية {new_expiry} وخصم {money(amount)} د.ع من المحفظة — ")
     msg += {PAY_CASH: f"نقداً: ربح {money(retail - amount)} د.ع",
             PAY_DEBT: f"دين: أُضيف {money(amount)} د.ع (سعر الجملة) لحساب الديون",
-            PAY_SELF: f"من قبلي: أُضيف {money(retail)} د.ع لتحصيل المبالغ (بدون أرباح)"}[payment_type]
+            PAY_SELF: f"من قبلي: مسدد وأُضيف {money(retail)} د.ع لتحصيل المبالغ، وانتقل لحساب يوزرات الدفع من قبلي"}[payment_type]
     flash(msg, "success")
     return redirect(url_for("subscriber_detail", subscriber_id=subscriber_id, done=activation_id))
 
@@ -2078,7 +2157,7 @@ def transfer(subscriber_id):
         return redirect(url_for("subscribers"))
     ops = con.execute("""
         SELECT a.*, p.name AS plan_name, p.retail_price AS plan_retail, p.self_price AS plan_self FROM activations a JOIN plans p ON p.id = a.plan_id
-        WHERE a.subscriber_id = ? AND a.payment_type <> 'نقد' ORDER BY a.id
+        WHERE a.subscriber_id = ? AND a.payment_type = 'دين' ORDER BY a.id
     """, (subscriber_id,)).fetchall()
     last = con.execute("""
         SELECT a.*, p.name AS plan_name, p.retail_price AS plan_retail, p.self_price AS plan_self FROM activations a JOIN plans p ON p.id = a.plan_id
@@ -2090,10 +2169,10 @@ def transfer(subscriber_id):
     here = url_for("transfer", subscriber_id=subscriber_id)
     if ops:
         cards = "".join(settle_card(op, prices, here) for op in ops)
-        intro = f'<p class="text-muted">عنده <b>{len(ops)}</b> عملية غير محصّلة. اختار الحالة الجديدة لكل وحدة — الترحيل ما يخصم من المحفظة وما يضيف مدة.</p>'
+        intro = f'<p class="text-muted">عنده <b>{len(ops)}</b> عملية دين. اختار الحالة الجديدة لكل وحدة — الترحيل ما يخصم من المحفظة وما يضيف مدة.</p>'
     elif last:
         cards = settle_card(last, prices, here)
-        intro = '<div class="alert alert-success">كل عمليات هذا المشترك محصّلة نقداً ✅. إذا تريد تغيّر حالة آخر عملية تكدر من هنا.</div>'
+        intro = '<div class="alert alert-success">ماكو دين على هذا المشترك ✅. إذا تريد تغيّر حالة آخر عملية تكدر من هنا.</div>'
     else:
         cards = ""
         intro = f"""<div class="alert alert-info">هذا المشترك ما عنده أي تفعيل بعد. لتجديد الاشتراك استخدم
@@ -2147,15 +2226,20 @@ def settle_operation(op_id):
             settled = precise_now()
         con.execute("""
             UPDATE activations SET payment_type = ?, retail_price = ?, profit = ?,
-                   paid_amount = ?, settled_at = ?
+                   paid_amount = ?, settled_at = ?,
+                   self_collected_at = CASE WHEN ? = 'من قبلي' AND payment_type = 'من قبلي' THEN self_collected_at ELSE NULL END
             WHERE id = ?
         """, (new_type, retail, retail - op["amount"],
-              retail if new_type == PAY_CASH else 0, settled, op_id))
+              retail if new_type == PAY_CASH else 0, settled, new_type, op_id))
+        if new_type == PAY_SELF and op["payment_type"] != PAY_SELF:
+            self_wallet_on_self(con, op_id)
+        elif new_type != PAY_SELF and op["payment_type"] == PAY_SELF:
+            self_wallet_clear(con, op_id)
         con.commit()
         con.close()
         msg = {PAY_CASH: f"تم الترحيل: استلام {money(retail)} د.ع نقداً — ربح {money(retail - op['amount'])} د.ع",
                PAY_DEBT: f"تم الترحيل: {money(op['amount'])} د.ع (سعر الجملة) صارت دين على {op['sub_name']}",
-               PAY_SELF: f"تم الترحيل: من قبلي {money(retail)} د.ع — أُضيف لتحصيل المبالغ (بدون أرباح)"}[new_type]
+               PAY_SELF: f"تم الترحيل: من قبلي {money(retail)} د.ع — مسدد بالحساب الرئيسي وانتقل لحساب يوزرات الدفع من قبلي"}[new_type]
         flash(msg, "success")
         return redirect(nxt)
 
@@ -2174,55 +2258,44 @@ def settle_operation(op_id):
 
 
 # ---------------------------------------------------------------------------
-# الديون والجيب الخاص
+# الديون
 # ---------------------------------------------------------------------------
 
 @app.route("/debts")
 @login_required
 def debts():
     con = db()
-    pending = con.execute("""
+    debt_ops = con.execute("""
         SELECT a.*, s.name, s.username, s.phone, s.expiry_date, p.name AS plan_name
         FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
-        WHERE a.payment_type IN ('دين', 'من قبلي')
+        WHERE a.payment_type = 'دين'
         ORDER BY a.operation_date DESC
     """).fetchall()
     since, _ = collection_since_charge(con)
-    collected = since["collected"]
     shop = get_setting(con, "shop_name")
     con.close()
 
-    debt_ops = [o for o in pending if o["payment_type"] == PAY_DEBT]
-    self_ops = [o for o in pending if o["payment_type"] == PAY_SELF]
     total_debt = sum(o["amount"] or 0 for o in debt_ops)
-    total_self = sum(o["retail_price"] or 0 for o in self_ops)
-    debt_by_sub = {}
-    sale_by_sub = {}  # بسعر البيع — للرسالة الي تنرسل للمشترك
+    debt_by_sub, sale_by_sub = {}, {}
     for o in debt_ops:
         debt_by_sub[o["subscriber_id"]] = debt_by_sub.get(o["subscriber_id"], 0) + (o["amount"] or 0)
         sale_by_sub[o["subscriber_id"]] = sale_by_sub.get(o["subscriber_id"], 0) + (o["retail_price"] or 0)
 
-    def rows(ops, kind):
-        html = ""
-        for o in ops:
-            amount = o["amount"] if kind == PAY_DEBT else o["retail_price"]
-            wa = wa_button(o["phone"], msg_debt(o, sale_by_sub.get(o["subscriber_id"], 0), shop), '') if kind == PAY_DEBT else ""
-            html += f"""
-            <tr>
-                <td><a href="{url_for('subscriber_detail', subscriber_id=o['subscriber_id'])}" class="fw-bold text-decoration-none">{esc(o['name'])}</a></td>
-                <td dir="ltr">{esc(o['username'])}</td>
-                <td>{esc(o['plan_name'])}</td>
-                <td class="fw-bold {'text-danger' if kind == PAY_DEBT else 'text-info'}">{money(amount)} د.ع</td>
-                <td>{esc(o['operation_date'][:10])}</td>
-                <td><div class="d-flex gap-1">
-                    <a href="{url_for('settle_operation', op_id=o['id'])}" class="btn btn-sm btn-warning"><i class="bi bi-arrow-left-right"></i> ترحيل</a>
-                    {wa}
-                </div></td>
-            </tr>"""
-        return html
+    rows = "".join(f"""
+        <tr>
+            <td><a href="{url_for('subscriber_detail', subscriber_id=o['subscriber_id'])}" class="fw-bold text-decoration-none">{esc(o['name'])}</a></td>
+            <td dir="ltr">{esc(o['username'])}</td>
+            <td>{esc(o['plan_name'])}</td>
+            <td class="fw-bold text-danger">{money(o['amount'])} د.ع</td>
+            <td>{esc(o['operation_date'][:10])}</td>
+            <td><div class="d-flex gap-1">
+                <a href="{url_for('settle_operation', op_id=o['id'])}" class="btn btn-sm btn-warning"><i class="bi bi-arrow-left-right"></i> ترحيل</a>
+                {wa_button(o['phone'], msg_debt(o, sale_by_sub.get(o['subscriber_id'], 0), shop), '')}
+            </div></td>
+        </tr>""" for o in debt_ops)
 
     body = f"""
-    <h2 class="mb-4">الديون ومسددين من قبلي</h2>
+    <h2 class="mb-4">الديون</h2>
 
     <div class="row g-3 mb-4">
         <div class="col-6 col-md-4">
@@ -2235,44 +2308,275 @@ def debts():
         </div>
         <div class="col-6 col-md-4">
             <div class="card stat-card p-4">
-                <span class="stat-icon" style="background:rgba(14,165,233,.14);color:#0ea5e9"><i class="bi bi-piggy-bank"></i></span>
-                <h6>مسددين من قبلي</h6>
-                <h2 class="text-info">{money(total_self)} د.ع</h2>
-                <small class="text-muted">{len(self_ops)} عملية — بدون أرباح</small>
+                <span class="stat-icon" style="background:rgba(16,185,129,.14);color:#10b981"><i class="bi bi-cash-stack"></i></span>
+                <h6>تحصيل المبالغ منذ آخر شحن</h6>
+                <h2 class="text-success">{money(since['collected'])} د.ع</h2>
             </div>
         </div>
         <div class="col-12 col-md-4">
+            <a href="{url_for('self_account')}" class="text-decoration-none">
             <div class="card stat-card p-4">
-                <span class="stat-icon" style="background:rgba(16,185,129,.14);color:#10b981"><i class="bi bi-cash-stack"></i></span>
-                <h6>تحصيل المبالغ منذ آخر شحن</h6>
-                <h2 class="text-success">{money(collected)} د.ع</h2>
+                <span class="stat-icon" style="background:rgba(14,165,233,.14);color:#0ea5e9"><i class="bi bi-piggy-bank"></i></span>
+                <h6>يوزرات الدفع من قبلي</h6>
+                <div class="text-info fw-bold">افتح الحساب ←</div>
             </div>
-        </div>
-    </div>
-
-    <div class="card p-4 mb-4">
-        <h5><i class="bi bi-journal-text text-danger"></i> الديون (بذمة المشتركين)</h5>
-        <p class="text-muted small">لما تستلم المبلغ اضغط <b>ترحيل</b> واختار <b>نقداً</b> — ينضاف الربح للأرباح والمبلغ لمجموع الاشتراكات.</p>
-        <div class="table-responsive">
-            <table class="table table-hover">
-                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الباقة</th><th>الدين (الجملة)</th><th>تاريخ التفعيل</th><th></th></tr></thead>
-                <tbody>{rows(debt_ops, PAY_DEBT) or '<tr><td colspan="6" class="text-muted text-center">ماكو ديون 👍</td></tr>'}</tbody>
-            </table>
+            </a>
         </div>
     </div>
 
     <div class="card p-4">
-        <h5><i class="bi bi-piggy-bank text-info"></i> مسددين من قبلي</h5>
-        <p class="text-muted small">هذي اليوزرات سددتها من قبلك (بسعر من قبلي) — مضافة لتحصيل المبالغ وبدون أرباح.</p>
+        <h5><i class="bi bi-journal-text text-danger"></i> الديون (بذمة المشتركين)</h5>
+        <p class="text-muted small">لما تستلم المبلغ اضغط <b>ترحيل</b> واختار <b>نقداً</b> — ينضاف الربح للأرباح والمبلغ لتحصيل المبالغ.
+        أو اختار <b>من قبلي</b> إذا دفعته انت عنه، فينتقل لحساب يوزرات الدفع من قبلي.</p>
         <div class="table-responsive">
             <table class="table table-hover">
-                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الباقة</th><th>المبلغ</th><th>تاريخ التفعيل</th><th></th></tr></thead>
-                <tbody>{rows(self_ops, PAY_SELF) or '<tr><td colspan="6" class="text-muted text-center">لا يوجد</td></tr>'}</tbody>
+                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الباقة</th><th>الدين (الجملة)</th><th>تاريخ التفعيل</th><th></th></tr></thead>
+                <tbody>{rows or '<tr><td colspan="6" class="text-muted text-center">ماكو ديون 👍</td></tr>'}</tbody>
             </table>
         </div>
     </div>
     """
     return page(body)
+
+
+# ---------------------------------------------------------------------------
+# حساب يوزرات الدفع من قبلي
+# بالحساب الرئيسي: المشترك مسدد ومبلغه بتحصيل المبالغ (بدون ربح).
+# هنا: المبلغ بذمته إلك، ولما يرجّعه تضغط "استلمت" وينحسب ربحه بهذا الحساب.
+# ---------------------------------------------------------------------------
+
+def self_account_totals(con, since=None):
+    unpaid = con.execute("""
+        SELECT COUNT(*) AS n, COUNT(DISTINCT subscriber_id) AS subs, COALESCE(SUM(retail_price), 0) AS total
+        FROM activations WHERE payment_type = 'من قبلي' AND self_collected_at IS NULL
+    """).fetchone()
+    cond, params = "", []
+    if since:
+        cond, params = " AND self_collected_at >= ?", [since]
+    got = con.execute(f"""
+        SELECT COUNT(*) AS n, COALESCE(SUM(retail_price), 0) AS total, COALESCE(SUM(profit), 0) AS profit
+        FROM activations WHERE payment_type = 'من قبلي' AND self_collected_at IS NOT NULL {cond}
+    """, params).fetchone()
+    return {"unpaid": unpaid["total"], "unpaid_n": unpaid["n"], "unpaid_subs": unpaid["subs"],
+            "got": got["total"], "got_n": got["n"], "profit": got["profit"]}
+
+
+@app.route("/self-account")
+@login_required
+def self_account():
+    con = db()
+    ops = con.execute("""
+        SELECT a.*, s.name, s.username, s.phone, s.expiry_date, p.name AS plan_name
+        FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
+        WHERE a.payment_type = 'من قبلي'
+        ORDER BY a.operation_date
+    """).fetchall()
+    month_start = date.today().replace(day=1).strftime("%Y-%m-%d")
+    month = self_account_totals(con, since=month_start)
+    total = self_account_totals(con)
+    shop = get_setting(con, "shop_name")
+    sw_balance = self_wallet_balance(con)
+    sw_moves = con.execute("SELECT * FROM self_wallet ORDER BY id DESC LIMIT 100").fetchall()
+    con.close()
+    move_rows = "".join(f"""
+        <tr>
+            <td>{esc(m['kind'])}</td>
+            <td class="fw-bold {'text-success' if m['kind'] in ('شحن', 'استلام') else 'text-danger'}">{'+' if m['kind'] in ('شحن', 'استلام') else '-'}{money(m['amount'])}</td>
+            <td>{esc(m['notes'])}</td>
+            <td>{esc(m['created_at'])}</td>
+        </tr>""" for m in sw_moves)
+
+    # تجميع حسب المشترك: كم اشتراك ما مسدد إلك
+    subs = {}
+    for o in ops:
+        d = subs.setdefault(o["subscriber_id"], {"o": o, "unpaid": [], "paid": 0, "profit": 0})
+        if o["self_collected_at"]:
+            d["paid"] += 1
+            d["profit"] += o["profit"] or 0
+        else:
+            d["unpaid"].append(o)
+    owing = sorted((d for d in subs.values() if d["unpaid"]), key=lambda d: -sum(x["retail_price"] for x in d["unpaid"]))
+    settled = [d for d in subs.values() if not d["unpaid"]]
+
+    def owing_row(d):
+        o = d["o"]
+        amount = sum(x["retail_price"] or 0 for x in d["unpaid"])
+        months = len(d["unpaid"])
+        dates = "، ".join(x["operation_date"][:10] for x in d["unpaid"])
+        return f"""
+        <tr>
+            <td><a href="{url_for('subscriber_detail', subscriber_id=o['subscriber_id'])}" class="fw-bold text-decoration-none">{esc(o['name'])}</a></td>
+            <td dir="ltr">{esc(o['username'])}</td>
+            <td><span class="badge {'bg-danger' if months > 1 else 'bg-warning text-dark'}">{months} اشتراك</span>
+                <div class="small text-muted">{esc(dates)}</div></td>
+            <td class="fw-bold text-info">{money(amount)} د.ع</td>
+            <td><div class="d-flex gap-1 flex-wrap">
+                <form method="post" action="{url_for('self_collect')}" data-confirm="استلمت {money(amount)} د.ع من {esc(o['name'])}؟">
+                    <input type="hidden" name="subscriber_id" value="{o['subscriber_id']}">
+                    <button class="btn btn-sm btn-success"><i class="bi bi-check2-circle"></i> استلمت الكل</button>
+                </form>
+                {f'''<form method="post" action="{url_for('self_collect')}">
+                    <input type="hidden" name="op_id" value="{d['unpaid'][0]['id']}">
+                    <button class="btn btn-sm btn-outline-success">استلمت اشتراك واحد</button>
+                </form>''' if months > 1 else ''}
+                {wa_button(o['phone'], msg_debt(o, amount, shop), '')}
+            </div></td>
+        </tr>"""
+
+    owing_rows = "".join(owing_row(d) for d in owing)
+    settled_rows = "".join(f"""
+        <tr>
+            <td><a href="{url_for('subscriber_detail', subscriber_id=d['o']['subscriber_id'])}" class="text-decoration-none">{esc(d['o']['name'])}</a></td>
+            <td dir="ltr">{esc(d['o']['username'])}</td>
+            <td><span class="badge bg-success">مسدد ✓</span></td>
+            <td>{d['paid']}</td>
+            <td class="text-success">{money(d['profit'])} د.ع</td>
+        </tr>""" for d in settled)
+
+    body = f"""
+    <h2 class="mb-4">يوزرات الدفع من قبلي</h2>
+
+    <div class="row g-3 mb-4">
+        <div class="col-6 col-md-4">
+            <div class="card stat-card p-4" style="background:linear-gradient(135deg,#0284c7,#0ea5e9);color:#fff;border:0">
+                <span class="stat-icon" style="background:rgba(255,255,255,.18);color:#fff"><i class="bi bi-piggy-bank"></i></span>
+                <h6 style="color:rgba(255,255,255,.85)">بذمتهم إلك</h6>
+                <h2>{money(total['unpaid'])} د.ع</h2>
+                <small style="color:rgba(255,255,255,.85)">{total['unpaid_n']} اشتراك على {total['unpaid_subs']} مشترك</small>
+            </div>
+        </div>
+        <div class="col-6 col-md-4">
+            <div class="card stat-card p-4">
+                <span class="stat-icon" style="background:rgba(16,185,129,.14);color:#10b981"><i class="bi bi-graph-up-arrow"></i></span>
+                <h6>أرباح هذا الحساب (الشهر)</h6>
+                <h2 class="text-success">{money(month['profit'])} د.ع</h2>
+                <small class="text-muted">الإجمالي: {money(total['profit'])} د.ع</small>
+            </div>
+        </div>
+        <div class="col-12 col-md-4">
+            <div class="card stat-card p-4">
+                <span class="stat-icon" style="background:rgba(79,70,229,.14);color:#4f46e5"><i class="bi bi-cash-stack"></i></span>
+                <h6>استلمت منهم هذا الشهر</h6>
+                <h2 class="text-primary">{money(month['got'])} د.ع</h2>
+                <small class="text-muted">{month['got_n']} اشتراك</small>
+            </div>
+        </div>
+    </div>
+
+    <div class="card p-4 mb-4" style="border:2px solid #0ea5e9">
+        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+            <h5 class="mb-0"><i class="bi bi-wallet2 text-info"></i> رصيد هذا الحساب</h5>
+            <h3 class="mb-0 fw-bold {'text-danger' if sw_balance < 0 else 'text-info'}">{money(sw_balance)} د.ع</h3>
+        </div>
+        <p class="text-muted small">كل يوزر يتحول لـ"من قبلي" <b>ينخصم سعر جملته</b> من هذا الرصيد، ولما يرجّعلك فلوسه
+        <b>يرجع المبلغ</b> للرصيد وينحسب ربحه. {'<b class="text-danger">الرصيد بالسالب — اشحن.</b>' if sw_balance < 0 else ''}</p>
+        <form method="post" action="{url_for('self_wallet_move')}" class="row g-2">
+            <div class="col-6 col-md-3"><select name="kind" class="form-select">
+                <option value="شحن">شحن رصيد</option><option value="سحب">سحب</option></select></div>
+            <div class="col-6 col-md-3"><input type="number" name="amount" min="1" class="form-control" placeholder="المبلغ" required></div>
+            <div class="col-8 col-md-4"><input name="notes" class="form-control" placeholder="ملاحظات"></div>
+            <div class="col-4 col-md-2"><button class="btn btn-info w-100 text-white">حفظ</button></div>
+        </form>
+    </div>
+
+    <div class="alert alert-info small">
+        المشترك هنا <b>مسدد بالحساب الرئيسي</b> ومبلغه محسوب بتحصيل المبالغ، بس <b>انت دافع عنه</b>.
+        كل شهر ما يدفعلك ينضاف عليه اشتراك. لما يدفعلك اضغط <b>استلمت</b> — وربحه ينحسب بهذا الحساب بس.
+    </div>
+
+    <div class="card p-4 mb-4">
+        <h5><i class="bi bi-hourglass-split text-warning"></i> ما مسددين إلك ({len(owing)})</h5>
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الاشتراكات</th><th>المبلغ</th><th></th></tr></thead>
+                <tbody>{owing_rows or '<tr><td colspan="5" class="text-muted text-center">الكل مسددين 👍</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card p-4">
+        <h5><i class="bi bi-check2-all text-success"></i> مسددين ({len(settled)})</h5>
+        <div class="table-responsive">
+            <table class="table">
+                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الحالة</th><th>اشتراكات مسددة</th><th>الربح</th></tr></thead>
+                <tbody>{settled_rows or '<tr><td colspan="5" class="text-muted text-center">لا يوجد</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card p-4 mt-4">
+        <h5><i class="bi bi-list-ul text-info"></i> حركات رصيد الحساب</h5>
+        <div class="table-responsive">
+            <table class="table table-striped">
+                <thead><tr><th>النوع</th><th>المبلغ</th><th>التفاصيل</th><th>التاريخ</th></tr></thead>
+                <tbody>{move_rows or '<tr><td colspan="4" class="text-muted text-center">لا توجد حركات — اشحن رصيدك أول</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+    """
+    return page(body)
+
+
+@app.route("/self-account/wallet", methods=["POST"])
+@login_required
+def self_wallet_move():
+    """شحن رصيد حساب الدفع من قبلي (أو سحب منه)."""
+    amount = parse_amount(request.form.get("amount"))
+    kind = SW_WITHDRAW if request.form.get("kind") == SW_WITHDRAW else SW_TOPUP
+    if not amount or amount <= 0:
+        flash("أدخل مبلغاً صحيحاً", "danger")
+        return redirect(url_for("self_account"))
+    con = db()
+    con.execute("INSERT INTO self_wallet (kind, amount, notes, created_at) VALUES (?, ?, ?, ?)",
+                (kind, amount, form_text("notes"), now_str()))
+    con.commit()
+    bal = self_wallet_balance(con)
+    con.close()
+    flash(f"تم {'شحن' if kind == SW_TOPUP else 'سحب'} {money(amount)} د.ع — رصيد حساب الدفع من قبلي: {money(bal)} د.ع", "success")
+    return redirect(url_for("self_account"))
+
+
+@app.route("/self-account/collect", methods=["POST"])
+@login_required
+def self_collect():
+    """استلام المبلغ من مشترك "من قبلي": اشتراك واحد أو كل الي بذمته."""
+    con = db()
+    now = precise_now()
+    base = """SELECT a.id, a.retail_price, s.username FROM activations a JOIN subscribers s ON s.id = a.subscriber_id
+              WHERE a.payment_type = 'من قبلي' AND a.self_collected_at IS NULL"""
+    if request.form.get("op_id", "").isdigit():
+        ops = con.execute(base + " AND a.id = ?", (int(request.form["op_id"]),)).fetchall()
+    elif request.form.get("subscriber_id", "").isdigit():
+        ops = con.execute(base + " AND a.subscriber_id = ?", (int(request.form["subscriber_id"]),)).fetchall()
+    else:
+        ops = []
+    for o in ops:
+        con.execute("UPDATE activations SET self_collected_at = ? WHERE id = ?", (now, o["id"]))
+        # المبلغ الي رجّعه المشترك يرجع لمحفظة حساب الدفع من قبلي
+        con.execute("INSERT INTO self_wallet (kind, amount, notes, activation_id, created_at) VALUES ('استلام', ?, ?, ?, ?)",
+                    (o["retail_price"], f"استلام من {o['username']}", o["id"], now_str()))
+    con.commit()
+    con.close()
+    n = len(ops)
+    flash(f"تم تسجيل استلام {n} اشتراك ✅ — وربحه انحسب بحساب الدفع من قبلي" if n else "ما تغيّر شي",
+          "success" if n else "warning")
+    back = request.form.get("back") or ""
+    return redirect(back if back.startswith("/") and not back.startswith("//") else url_for("self_account"))
+
+
+@app.route("/self-account/undo", methods=["POST"])
+@login_required
+def self_uncollect():
+    op_id = request.form.get("op_id", "")
+    con = db()
+    s = con.execute("SELECT subscriber_id FROM activations WHERE id = ?", (op_id,)).fetchone() if op_id.isdigit() else None
+    if s:
+        con.execute("UPDATE activations SET self_collected_at = NULL WHERE id = ? AND payment_type = 'من قبلي'", (op_id,))
+        self_wallet_clear(con, int(op_id), ("استلام",))
+        con.commit()
+        flash("رجعت العملية غير مسددة", "success")
+    con.close()
+    return redirect(url_for("subscriber_detail", subscriber_id=s["subscriber_id"]) if s else url_for("self_account"))
 
 
 # ---------------------------------------------------------------------------
@@ -3516,7 +3820,7 @@ def settings():
                 dst = sqlite3.connect(bpath)
                 con.backup(dst)
                 dst.close()
-                for table in ("debts", "activations", "wallet_transactions", "subscribers"):
+                for table in ("debts", "activations", "wallet_transactions", "subscribers", "self_wallet"):
                     con.execute(f"DELETE FROM {table}")
                 if request.form.get("reset_plans") == "1":
                     con.execute("DELETE FROM plans")
