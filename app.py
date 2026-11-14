@@ -289,9 +289,10 @@ def self_price_of(plan):
     return plan["self_price"] or plan["retail_price"]
 
 
-# دين المشترك = مجموع أسعار البيع للتفعيلات الي حالتها دين (داخل استعلام فيه s = المشتركين)
+# دين المشترك = مجموع أسعار الجملة (المخصومة من المحفظة) للتفعيلات الي حالتها دين
+# (داخل استعلام فيه s = المشتركين)
 DEBT_SUBQUERY = """
-    SELECT COALESCE(SUM(a.retail_price), 0) FROM activations a
+    SELECT COALESCE(SUM(a.amount), 0) FROM activations a
     WHERE a.subscriber_id = s.id AND a.payment_type = 'دين'
 """
 # المسدد من قبلي لهذا المشترك = مجموع أسعار التفعيلات "من قبلي"
@@ -976,7 +977,7 @@ def money_totals(con, since=None, until=None):
         FROM activations WHERE payment_type = 'من قبلي' {cond}
     """, params).fetchone()
     debt = con.execute("""
-        SELECT COUNT(DISTINCT subscriber_id) AS n, COALESCE(SUM(retail_price), 0) AS total
+        SELECT COUNT(DISTINCT subscriber_id) AS n, COALESCE(SUM(amount), 0) AS total
         FROM activations WHERE payment_type = 'دين'
     """).fetchone()
     return {"cash_n": cash["n"], "cash": cash["total"], "profit": cash["profit"],
@@ -1387,8 +1388,8 @@ PAY_CALC_JS = """
             out.innerHTML = '✅ يُضاف <b>' + fmt(price) + '</b> لتحصيل المبالغ، وربح <b class="' +
                 (profit < 0 ? 'text-danger' : 'text-success') + '">' + fmt(profit) + ' د.ع</b> للأرباح';
         } else if (t === 'دين') {
-            out.innerHTML = '📒 يُضاف <b class="text-danger">' + fmt(price) +
-                ' د.ع</b> لحساب الديون — الربح ينحسب لما تستلم المبلغ (ترحيل)';
+            out.innerHTML = '📒 يُضاف <b class="text-danger">' + fmt(wholesale) +
+                ' د.ع</b> (سعر الجملة) لحساب الديون — الربح ينحسب لما تستلم المبلغ (ترحيل)';
         } else {
             out.innerHTML = '🐷 من قبلي: يُضاف <b>' + fmt(price) +
                 ' د.ع</b> لتحصيل المبالغ ولقائمة مسددين من قبلي — <b>بدون أرباح</b>';
@@ -1949,7 +1950,7 @@ def perform_activation(subscriber_id):
 
     msg = (f"تم تفعيل {subscriber['username']} لغاية {new_expiry} وخصم {money(amount)} د.ع من المحفظة — ")
     msg += {PAY_CASH: f"نقداً: ربح {money(retail - amount)} د.ع",
-            PAY_DEBT: f"دين: أُضيف {money(retail)} د.ع لحساب الديون",
+            PAY_DEBT: f"دين: أُضيف {money(amount)} د.ع (سعر الجملة) لحساب الديون",
             PAY_SELF: f"من قبلي: أُضيف {money(retail)} د.ع لتحصيل المبالغ (بدون أرباح)"}[payment_type]
     flash(msg, "success")
     return redirect(url_for("subscriber_detail", subscriber_id=subscriber_id, done=activation_id))
@@ -2134,7 +2135,7 @@ def settle_operation(op_id):
         con.commit()
         con.close()
         msg = {PAY_CASH: f"تم الترحيل: استلام {money(retail)} د.ع نقداً — ربح {money(retail - op['amount'])} د.ع",
-               PAY_DEBT: f"تم الترحيل: {money(retail)} د.ع صارت دين على {op['sub_name']}",
+               PAY_DEBT: f"تم الترحيل: {money(op['amount'])} د.ع (سعر الجملة) صارت دين على {op['sub_name']}",
                PAY_SELF: f"تم الترحيل: من قبلي {money(retail)} د.ع — أُضيف لتحصيل المبالغ (بدون أرباح)"}[new_type]
         flash(msg, "success")
         return redirect(nxt)
@@ -2174,16 +2175,16 @@ def debts():
 
     debt_ops = [o for o in pending if o["payment_type"] == PAY_DEBT]
     self_ops = [o for o in pending if o["payment_type"] == PAY_SELF]
-    total_debt = sum(o["retail_price"] or 0 for o in debt_ops)
+    total_debt = sum(o["amount"] or 0 for o in debt_ops)
     total_self = sum(o["retail_price"] or 0 for o in self_ops)
     debt_by_sub = {}
     for o in debt_ops:
-        debt_by_sub[o["subscriber_id"]] = debt_by_sub.get(o["subscriber_id"], 0) + (o["retail_price"] or 0)
+        debt_by_sub[o["subscriber_id"]] = debt_by_sub.get(o["subscriber_id"], 0) + (o["amount"] or 0)
 
     def rows(ops, kind):
         html = ""
         for o in ops:
-            amount = o["retail_price"]
+            amount = o["amount"] if kind == PAY_DEBT else o["retail_price"]
             wa = wa_button(o["phone"], msg_debt(o, debt_by_sub.get(o["subscriber_id"], 0), shop), '') if kind == PAY_DEBT else ""
             html += f"""
             <tr>
@@ -2233,7 +2234,7 @@ def debts():
         <p class="text-muted small">لما تستلم المبلغ اضغط <b>ترحيل</b> واختار <b>نقداً</b> — ينضاف الربح للأرباح والمبلغ لمجموع الاشتراكات.</p>
         <div class="table-responsive">
             <table class="table table-hover">
-                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الباقة</th><th>المبلغ</th><th>تاريخ التفعيل</th><th></th></tr></thead>
+                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الباقة</th><th>الدين (الجملة)</th><th>تاريخ التفعيل</th><th></th></tr></thead>
                 <tbody>{rows(debt_ops, PAY_DEBT) or '<tr><td colspan="6" class="text-muted text-center">ماكو ديون 👍</td></tr>'}</tbody>
             </table>
         </div>
