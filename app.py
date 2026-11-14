@@ -2772,8 +2772,15 @@ def split_whatsapp_messages(text):
     return messages
 
 
+# رسالة الشركة: "تم تفعيل اشتراك انترنيت mu3f13p12 / نوع الاشتراك BASIC / المتبقي في حسابك 472000"
+_CO_USER = re.compile(r"تفعيل\s+اشتراك[^\n]*?([A-Za-z0-9][A-Za-z0-9@._\-]{2,})")
+_CO_TYPE = re.compile(r"نوع\s+الاشتراك\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9 +\-]*)")
+_CO_LEFT = re.compile(r"المتبقي\s+في\s+حسابك\s*[:：]?\s*([\d,]+)")
+
+
 def find_activations_in_chat(con, text):
-    """يدور على يوزرات المشتركين الموجودين داخل الرسائل."""
+    """يدور على التفعيلات داخل الرسائل.
+    يرجع (موجودين، جدد، عدد الرسائل، رسائل بدون يوزر، آخر رصيد بحساب الشركة)."""
     subs = {}
     for s in con.execute("""
         SELECT s.id, s.name, s.username, s.plan_id, s.expiry_date, p.name AS plan_name,
@@ -2781,11 +2788,43 @@ def find_activations_in_chat(con, text):
         FROM subscribers s JOIN plans p ON p.id = s.plan_id
     """):
         subs.setdefault(s["username"].strip().lower(), dict(s))
-    found, seen, unmatched = [], set(), 0
-    messages = split_whatsapp_messages(text)
+    plans_list = con.execute("SELECT * FROM plans").fetchall()
+    plans_by_id = {p["id"]: p for p in plans_list}
+
+    found, unknown, seen, unmatched = [], [], set(), 0
+    company_left = None  # (التاريخ، الوقت، المبلغ)
+    messages = []
+    for day, tm, body in split_whatsapp_messages(text):
+        # أكثر من رسالة ملصوقة ورا بعض بدون تواريخ: نقسمها عند "تم تفعيل"
+        parts = [x for x in re.split(r"(?=تم\s+تفعيل)", body) if x.strip()] or [body]
+        messages += [(day, tm, part) for part in parts]
+
     for day, tm, body in messages:
+        card = _CO_TYPE.search(body)
+        card_type = " ".join(card.group(1).split()) if card else ""
+        left = _CO_LEFT.search(body)
+        if left and (company_left is None or (day, tm) >= company_left[:2]):
+            company_left = (day, tm, parse_amount(left.group(1)))
+        plan_id = guess_plan(card_type, plans_list) if card_type else "new"
+
+        co_user = _CO_USER.search(body)
         tokens = {t.lower().strip("._-") for t in re.findall(r"[A-Za-z0-9@._\-]{3,}", body)}
+        if co_user:
+            tokens.add(co_user.group(1).lower().strip("._-"))
         hits = [subs[t] for t in tokens if t in subs]
+
+        if not hits and co_user:
+            uname = co_user.group(1).strip("._-")
+            key = (uname.lower(), day)
+            if key not in seen:
+                seen.add(key)
+                plan = plans_by_id.get(plan_id) if plan_id != "new" else None
+                unknown.append({"username": uname, "day": day, "time": tm, "card_type": card_type,
+                                "plan_id": plan["id"] if plan else None,
+                                "plan_name": plan["name"] if plan else "",
+                                "wholesale_price": plan["wholesale_price"] if plan else 0,
+                                "snippet": " ".join(body.split())[:140]})
+            continue
         if not hits:
             unmatched += 1
             continue
@@ -2794,13 +2833,21 @@ def find_activations_in_chat(con, text):
             if key in seen:
                 continue
             seen.add(key)
+            row = dict(s)
+            # إذا نوع الاشتراك بالرسالة يختلف عن باقة المشترك ناخذ الي بالرسالة
+            if plan_id != "new" and plan_id != s["plan_id"]:
+                p = plans_by_id[plan_id]
+                row.update(plan_id=p["id"], plan_name=p["name"], wholesale_price=p["wholesale_price"],
+                           retail_price=p["retail_price"], plan_changed=True)
             already = con.execute("""
                 SELECT 1 FROM activations WHERE subscriber_id = ? AND substr(operation_date, 1, 10) = ?
             """, (s["id"], day)).fetchone()
-            found.append({**s, "day": day, "time": tm, "already": bool(already),
-                          "snippet": " ".join(body.split())[:140]})
+            row.update(day=day, time=tm, already=bool(already), card_type=card_type,
+                       snippet=" ".join(body.split())[:140])
+            found.append(row)
     found.sort(key=lambda r: (r["day"], r["time"]))
-    return found, len(messages), unmatched
+    unknown.sort(key=lambda r: (r["day"], r["time"]))
+    return found, unknown, len(messages), unmatched, company_left
 
 
 def _read_chat_upload(file):
@@ -2835,17 +2882,17 @@ def wa_import():
             flash("الصق الرسائل أو ارفع ملف تصدير الدردشة", "danger")
             return redirect(url_for("wa_import"))
         con = db()
-        found, total, unmatched = find_activations_in_chat(con, text)
+        found, unknown, total, unmatched, company_left = find_activations_in_chat(con, text)
         con.close()
-        if not found:
-            flash(f"قريت {total} رسالة بس ما لگيت بيها أي يوزر من مشتركينك. "
-                  f"تأكد إن اليوزرات مضافة بالبرنامج.", "warning")
+        if not found and not unknown:
+            flash(f"قريت {total} رسالة بس ما لگيت بيها أي رسالة تفعيل أو يوزر من مشتركينك.", "warning")
             return redirect(url_for("wa_import"))
         os.makedirs(IMPORT_DIR, exist_ok=True)
         _cleanup_imports()
         token = secrets.token_hex(16)
         with open(_import_path(token), "w", encoding="utf-8") as f:
-            json.dump({"rows": found, "total": total, "unmatched": unmatched}, f, ensure_ascii=False)
+            json.dump({"rows": found, "unknown": unknown, "total": total, "unmatched": unmatched,
+                       "company_left": company_left}, f, ensure_ascii=False)
         return redirect(url_for("wa_import", t=token))
 
     if request.method == "POST" and request.form.get("step") == "confirm":
@@ -2854,17 +2901,31 @@ def wa_import():
             flash("انتهت صلاحية العملية، اقرأ الرسائل مرة ثانية", "danger")
             return redirect(url_for("wa_import"))
         with open(path, encoding="utf-8") as f:
-            rows = json.load(f)["rows"]
+            payload = json.load(f)
+        rows = list(payload["rows"])
+        n_listed = len(rows)
 
         con = db()
         con.execute("BEGIN IMMEDIATE")
-        done = skipped = no_balance = 0
+        done = skipped = no_balance = added = 0
         cost = 0
+        # يوزرات جديدة: نضيفهم كمشتركين أول
+        for j, u in enumerate(payload.get("unknown", [])):
+            if request.form.get(f"new_{j}") != "1" or not u["plan_id"]:
+                continue
+            if con.execute("SELECT 1 FROM subscribers WHERE lower(username) = lower(?)", (u["username"],)).fetchone():
+                continue
+            cur = con.execute("""
+                INSERT INTO subscribers (name, username, phone, plan_id, activation_date, expiry_date, notes, created_at)
+                VALUES (?, ?, '', ?, ?, ?, '', ?)
+            """, (u["username"], u["username"], u["plan_id"], u["day"], u["day"], now_str()))
+            added += 1
+            rows.append({**u, "id": cur.lastrowid})
         for i, r in enumerate(rows):
-            if request.form.get(f"use_{i}") != "1":
+            if i < n_listed and request.form.get(f"use_{i}") != "1":
                 continue
             s = con.execute("SELECT * FROM subscribers WHERE id = ?", (r["id"],)).fetchone()
-            plan = con.execute("SELECT * FROM plans WHERE id = ?", (s["plan_id"],)).fetchone() if s else None
+            plan = con.execute("SELECT * FROM plans WHERE id = ?", (r.get("plan_id") or s["plan_id"],)).fetchone() if s else None
             if not s or not plan:
                 skipped += 1
                 continue
@@ -2893,8 +2954,8 @@ def wa_import():
                  payment_type, paid_amount, settled_at, notes, operation_date)
                 VALUES (?, ?, 'تفعيل', ?, ?, ?, 'دين', 0, NULL, 'من رسائل واتساب الشركة', ?)
             """, (s["id"], plan["id"], amount, plan["retail_price"], plan["retail_price"] - amount, when))
-            con.execute("UPDATE subscribers SET activation_date = ?, expiry_date = ? WHERE id = ?",
-                        (r["day"], new_expiry, s["id"]))
+            con.execute("UPDATE subscribers SET activation_date = ?, expiry_date = ?, plan_id = ? WHERE id = ?",
+                        (r["day"], new_expiry, plan["id"], s["id"]))
             done += 1
             cost += amount
         con.commit()
@@ -2904,6 +2965,8 @@ def wa_import():
         except OSError:
             pass
         msg = f"تم تسجيل {done} تفعيل كـ دين — أُضيف شهر لكل واحد وخُصم {money(cost)} د.ع من المحفظة"
+        if added:
+            msg += f" — وأُضيف {added} مشترك جديد (عدّل أسماءهم وأرقامهم بعدين)"
         if skipped:
             msg += f" — تخطي {skipped} (مسجل من قبل بنفس اليوم)"
         flash(msg, "success" if done else "warning")
@@ -2922,14 +2985,54 @@ def wa_import():
         balance = wallet_balance(con)
         con.close()
         new_rows = [r for r in rows if not r["already"]]
+        unknown = payload.get("unknown", [])
         need = sum(r["wholesale_price"] for r in new_rows)
+        left = payload.get("company_left")
+        company_html = ""
+        if left:
+            after = balance - need
+            diff = after - (left[2] or 0)
+            unknown_cost = sum(u["wholesale_price"] for u in unknown)
+            if diff == 0:
+                note = "✅ متطابق"
+            elif unknown and diff == unknown_cost:
+                note = "✅ يتطابق إذا أضفت اليوزرات الجديدة الي تحت"
+            else:
+                note = f"— الفرق: <b>{money(diff)}</b> (تأكد من الشحنات أو التفعيلات الناقصة)"
+            company_html = f"""
+            <div class="alert {'alert-success' if note.startswith('✅') else 'alert-warning'}">
+                <i class="bi bi-bank"></i> آخر رصيد بحساب الشركة (رسالة {esc(left[0])} {esc(left[1])}): <b>{money(left[2])} د.ع</b>
+                — رصيد البرنامج بعد التسجيل: <b>{money(after)} د.ع</b> {note}
+            </div>"""
+        unknown_html = ""
+        if unknown:
+            urows = "".join(f"""
+                <tr>
+                    <td><input type="checkbox" name="new_{j}" value="1" class="form-check-input" {'disabled' if not u['plan_id'] else ''}></td>
+                    <td>{esc(u['day'])} <small class="text-muted">{esc(u['time'])}</small></td>
+                    <td dir="ltr"><b>{esc(u['username'])}</b></td>
+                    <td dir="ltr">{esc(u['card_type'])}</td>
+                    <td>{esc(u['plan_name']) or '<span class="text-danger">باقة غير معروفة</span>'}</td>
+                    <td>{money(u['wholesale_price'])}</td>
+                </tr>""" for j, u in enumerate(unknown))
+            unknown_html = f"""
+            <div class="card p-4 mb-4 border-warning" style="border-width:2px">
+                <h5><i class="bi bi-person-plus text-warning"></i> يوزرات مو موجودة بالبرنامج ({len(unknown)})</h5>
+                <p class="text-muted small">إذا تريد، أشّر عليها حتى تنضاف كمشتركين جدد (الاسم = اليوزر) وينسجل تفعيلها دين مثل الباقي.</p>
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead><tr><th></th><th>التاريخ</th><th>اليوزر</th><th>نوع الاشتراك</th><th>الباقة</th><th>الجملة</th></tr></thead>
+                        <tbody>{urows}</tbody>
+                    </table>
+                </div>
+            </div>"""
         table = "".join(f"""
             <tr class="{'opacity-50' if r['already'] else ''}">
                 <td><input type="checkbox" name="use_{i}" value="1" class="form-check-input row-check" {'' if r['already'] else 'checked'}></td>
                 <td>{esc(r['day'])} <small class="text-muted">{esc(r['time'])}</small></td>
                 <td dir="ltr"><b>{esc(r['username'])}</b></td>
                 <td>{esc(r['name'])}</td>
-                <td>{esc(r['plan_name'])}</td>
+                <td>{esc(r['plan_name'])}{' <span class="badge bg-info text-dark">تغيّرت</span>' if r.get('plan_changed') else ''}</td>
                 <td>{money(r['wholesale_price'])}</td>
                 <td>{'<span class="badge bg-secondary">مسجل من قبل</span>' if r['already'] else '<span class="badge bg-success">جديد</span>'}</td>
                 <td><small class="text-muted">{esc(r['snippet'])}</small></td>
@@ -2950,6 +3053,7 @@ def wa_import():
             </div>
             <div class="alert alert-info">كل تفعيل محدد: <b>يضيف شهر</b> للمشترك، <b>يخصم سعر الجملة</b> من المحفظة،
             ويتسجل <b>دين</b>. لما تستلم المبلغ رحّله نقداً.</div>
+            {company_html}
             <div class="card p-4 mb-4">
                 <div class="form-check mb-2">
                     <input class="form-check-input" type="checkbox" id="allChk"
@@ -2959,10 +3063,11 @@ def wa_import():
                 <div class="table-responsive">
                     <table class="table table-hover">
                         <thead><tr><th></th><th>التاريخ</th><th>اليوزر</th><th>الاسم</th><th>الباقة</th><th>الجملة</th><th>الحالة</th><th>الرسالة</th></tr></thead>
-                        <tbody>{table}</tbody>
+                        <tbody>{table or '<tr><td colspan="8" class="text-muted text-center">كل اليوزرات بالرسائل مو موجودة بالبرنامج — شوف القسم الجاي</td></tr>'}</tbody>
                     </table>
                 </div>
             </div>
+            {unknown_html}
             <div class="d-flex gap-2 import-actions">
                 <button class="btn btn-success flex-fill py-3"><i class="bi bi-check2-all"></i> تسجيل التفعيلات المحددة</button>
                 <a href="{url_for('wa_import')}" class="btn btn-outline-secondary py-3">إلغاء</a>
