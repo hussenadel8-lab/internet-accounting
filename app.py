@@ -214,6 +214,18 @@ def init_db():
 
     cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 
+    # مبالغ قديمة بذمة المشتركين (من قبل البرنامج) بحساب الدفع من قبلي
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS self_old (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subscriber_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            collected_at TEXT
+        )
+    """)
+
     # محفظة حساب "يوزرات الدفع من قبلي": شحن (رصيدك) / خصم (جملة كل يوزر) / استلام (لما يرجّعلك)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS self_wallet (
@@ -318,8 +330,10 @@ DEBT_SALE_SUBQUERY = """
 """
 # المبلغ الي بذمة المشترك إلك (دفعته عنه "من قبلي" وبعده ما رجّعه)
 SELF_SUBQUERY = """
-    SELECT COALESCE(SUM(a.retail_price), 0) FROM activations a
-    WHERE a.subscriber_id = s.id AND a.payment_type = 'من قبلي' AND a.self_collected_at IS NULL
+    (SELECT COALESCE(SUM(a.retail_price), 0) FROM activations a
+     WHERE a.subscriber_id = s.id AND a.payment_type = 'من قبلي' AND a.self_collected_at IS NULL)
+    + (SELECT COALESCE(SUM(o.amount), 0) FROM self_old o
+       WHERE o.subscriber_id = s.id AND o.collected_at IS NULL)
 """
 
 
@@ -1876,6 +1890,18 @@ def subscriber_detail(subscriber_id):
     </div>
 
     <div class="card p-4 mb-4">
+        <h5><i class="bi bi-piggy-bank text-info"></i> إضافة مبلغ مطلوب سابقاً (حساب الدفع من قبلي)</h5>
+        <p class="text-muted small mb-2">مبلغ قديم بذمته إلك. ينضاف على حسابه بيوزرات الدفع من قبلي — حالياً بذمته: <b>{money(self_paid)} د.ع</b></p>
+        <form method="post" action="{url_for('self_old_add')}" class="row g-2">
+            <input type="hidden" name="subscriber_id" value="{subscriber_id}">
+            <input type="hidden" name="back" value="{url_for('subscriber_detail', subscriber_id=subscriber_id)}">
+            <div class="col-5 col-md-3"><input type="number" name="amount" min="1" class="form-control" placeholder="المبلغ" required></div>
+            <div class="col-7 col-md-6"><input name="notes" class="form-control" placeholder="ملاحظة"></div>
+            <div class="col-12 col-md-3"><button class="btn btn-secondary w-100">إضافة على حسابه</button></div>
+        </form>
+    </div>
+
+    <div class="card p-4 mb-4">
         <h5><i class="bi bi-whatsapp" style="color:#25D366"></i> مراسلة المشترك على واتساب</h5>
         {"<p class='text-muted mb-0'>أضف رقم هاتف للمشترك حتى تكدر تراسله.</p>" if not wa_phone(s['phone']) else f'''
         <div class="d-flex flex-wrap gap-2 mb-3">
@@ -1955,6 +1981,7 @@ def delete_subscriber(subscriber_id):
     con.execute("DELETE FROM debts WHERE subscriber_id = ?", (subscriber_id,))
     con.execute("DELETE FROM self_wallet WHERE activation_id IN (SELECT id FROM activations WHERE subscriber_id = ?)",
                 (subscriber_id,))
+    con.execute("DELETE FROM self_old WHERE subscriber_id = ?", (subscriber_id,))
     con.execute("DELETE FROM activations WHERE subscriber_id = ?", (subscriber_id,))
     con.execute("DELETE FROM subscribers WHERE id = ?", (subscriber_id,))
     con.commit()
@@ -2347,9 +2374,15 @@ def debts():
 
 def self_account_totals(con, since=None):
     unpaid = con.execute("""
-        SELECT COUNT(*) AS n, COUNT(DISTINCT subscriber_id) AS subs, COALESCE(SUM(retail_price), 0) AS total
+        SELECT COUNT(*) AS n, COALESCE(SUM(retail_price), 0) AS total
         FROM activations WHERE payment_type = 'من قبلي' AND self_collected_at IS NULL
     """).fetchone()
+    old = con.execute("SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total FROM self_old WHERE collected_at IS NULL").fetchone()
+    subs = con.execute("""
+        SELECT COUNT(*) AS c FROM (
+            SELECT subscriber_id FROM activations WHERE payment_type = 'من قبلي' AND self_collected_at IS NULL
+            UNION SELECT subscriber_id FROM self_old WHERE collected_at IS NULL)
+    """).fetchone()["c"]
     cond, params = "", []
     if since:
         cond, params = " AND self_collected_at >= ?", [since]
@@ -2357,8 +2390,13 @@ def self_account_totals(con, since=None):
         SELECT COUNT(*) AS n, COALESCE(SUM(retail_price), 0) AS total, COALESCE(SUM(profit), 0) AS profit
         FROM activations WHERE payment_type = 'من قبلي' AND self_collected_at IS NOT NULL {cond}
     """, params).fetchone()
-    return {"unpaid": unpaid["total"], "unpaid_n": unpaid["n"], "unpaid_subs": unpaid["subs"],
-            "got": got["total"], "got_n": got["n"], "profit": got["profit"]}
+    got_old = con.execute(f"""
+        SELECT COALESCE(SUM(amount), 0) AS total FROM self_old
+        WHERE collected_at IS NOT NULL {cond.replace('self_collected_at', 'collected_at')}
+    """, params).fetchone()["total"]
+    return {"unpaid": unpaid["total"] + old["total"], "unpaid_n": unpaid["n"], "unpaid_subs": subs,
+            "old": old["total"], "old_n": old["n"],
+            "got": got["total"] + got_old, "got_n": got["n"], "profit": got["profit"]}
 
 
 @app.route("/self-account")
@@ -2377,7 +2415,13 @@ def self_account():
     shop = get_setting(con, "shop_name")
     sw_balance = self_wallet_balance(con)
     sw_moves = con.execute("SELECT * FROM self_wallet ORDER BY id DESC LIMIT 100").fetchall()
+    olds = con.execute("""
+        SELECT o.*, s.name, s.username, s.phone, s.id AS subscriber_id FROM self_old o
+        JOIN subscribers s ON s.id = o.subscriber_id ORDER BY o.id
+    """).fetchall()
+    all_subs = con.execute("SELECT id, name, username FROM subscribers ORDER BY name").fetchall()
     con.close()
+    sub_options = "".join(f'<option value="{x["id"]}">{esc(x["name"])} — {esc(x["username"])}</option>' for x in all_subs)
     move_rows = "".join(f"""
         <tr>
             <td>{esc(m['kind'])}</td>
@@ -2389,26 +2433,37 @@ def self_account():
     # تجميع حسب المشترك: كم اشتراك ما مسدد إلك
     subs = {}
     for o in ops:
-        d = subs.setdefault(o["subscriber_id"], {"o": o, "unpaid": [], "paid": 0, "profit": 0})
+        d = subs.setdefault(o["subscriber_id"], {"o": o, "unpaid": [], "old": [], "paid": 0, "profit": 0})
         if o["self_collected_at"]:
             d["paid"] += 1
             d["profit"] += o["profit"] or 0
         else:
             d["unpaid"].append(o)
-    owing = sorted((d for d in subs.values() if d["unpaid"]), key=lambda d: -sum(x["retail_price"] for x in d["unpaid"]))
-    settled = [d for d in subs.values() if not d["unpaid"]]
+    for x in olds:
+        d = subs.setdefault(x["subscriber_id"], {"o": x, "unpaid": [], "old": [], "paid": 0, "profit": 0})
+        if not x["collected_at"]:
+            d["old"].append(x)
+    owed = lambda d: sum(x["retail_price"] or 0 for x in d["unpaid"]) + sum(x["amount"] for x in d["old"])
+    owing = sorted((d for d in subs.values() if d["unpaid"] or d["old"]), key=lambda d: -owed(d))
+    settled = [d for d in subs.values() if not d["unpaid"] and not d["old"] and d["paid"]]
 
     def owing_row(d):
         o = d["o"]
-        amount = sum(x["retail_price"] or 0 for x in d["unpaid"])
+        amount = owed(d)
         months = len(d["unpaid"])
         dates = "، ".join(x["operation_date"][:10] for x in d["unpaid"])
+        old_html = "".join(f"""<div><span class="badge bg-secondary">مبلغ سابق {money(x['amount'])}</span>
+            <small class="text-muted">{esc(x['notes'])}</small>
+            <form method="post" action="{url_for('self_old_delete')}" class="d-inline" data-confirm="حذف هذا المبلغ السابق؟">
+                <input type="hidden" name="id" value="{x['id']}">
+                <button class="btn btn-link btn-sm p-0 text-danger" title="حذف"><i class="bi bi-x-circle"></i></button></form></div>"""
+            for x in d["old"])
         return f"""
         <tr>
             <td><a href="{url_for('subscriber_detail', subscriber_id=o['subscriber_id'])}" class="fw-bold text-decoration-none">{esc(o['name'])}</a></td>
             <td dir="ltr">{esc(o['username'])}</td>
-            <td><span class="badge {'bg-danger' if months > 1 else 'bg-warning text-dark'}">{months} اشتراك</span>
-                <div class="small text-muted">{esc(dates)}</div></td>
+            <td>{f'<span class="badge {"bg-danger" if months > 1 else "bg-warning text-dark"}">{months} اشتراك</span>' if months else ''}
+                <div class="small text-muted">{esc(dates)}</div>{old_html}</td>
             <td class="fw-bold text-info">{money(amount)} د.ع</td>
             <td><div class="d-flex gap-1 flex-wrap">
                 <form method="post" action="{url_for('self_collect')}" data-confirm="استلمت {money(amount)} د.ع من {esc(o['name'])}؟">
@@ -2479,6 +2534,19 @@ def self_account():
         </form>
     </div>
 
+    <div class="card p-4 mb-4">
+        <h5><i class="bi bi-clock-history text-secondary"></i> إضافة مبلغ مطلوب سابقاً</h5>
+        <p class="text-muted small">مبلغ قديم بذمة المشترك (من قبل البرنامج). ينضاف على حسابه بدون خصم من الرصيد،
+        ولما تضغط <b>استلمت الكل</b> يرجع المبلغ للرصيد.</p>
+        <form method="post" action="{url_for('self_old_add')}" class="row g-2">
+            <div class="col-md-5"><select name="subscriber_id" class="form-select" required>
+                <option value="">اختار المشترك</option>{sub_options}</select></div>
+            <div class="col-6 col-md-2"><input type="number" name="amount" min="1" class="form-control" placeholder="المبلغ" required></div>
+            <div class="col-6 col-md-3"><input name="notes" class="form-control" placeholder="ملاحظة (مثلاً: دين قديم)"></div>
+            <div class="col-md-2"><button class="btn btn-secondary w-100">إضافة</button></div>
+        </form>
+    </div>
+
     <div class="alert alert-info small">
         المشترك هنا <b>مسدد بالحساب الرئيسي</b> ومبلغه محسوب بتحصيل المبالغ، بس <b>انت دافع عنه</b>.
         كل شهر ما يدفعلك ينضاف عليه اشتراك. لما يدفعلك اضغط <b>استلمت</b> — وربحه ينحسب بهذا الحساب بس.
@@ -2536,6 +2604,43 @@ def self_wallet_move():
     return redirect(url_for("self_account"))
 
 
+@app.route("/self-account/old", methods=["POST"])
+@login_required
+def self_old_add():
+    """إضافة مبلغ قديم بذمة مشترك (بدون خصم من الرصيد)."""
+    sid = request.form.get("subscriber_id", "")
+    amount = parse_amount(request.form.get("amount"))
+    back = request.form.get("back") or ""
+    back = back if back.startswith("/") and not back.startswith("//") else url_for("self_account")
+    con = db()
+    s = con.execute("SELECT name FROM subscribers WHERE id = ?", (sid,)).fetchone() if sid.isdigit() else None
+    if not s or not amount or amount <= 0:
+        con.close()
+        flash("اختار المشترك واكتب مبلغ صحيح", "danger")
+        return redirect(back)
+    con.execute("INSERT INTO self_old (subscriber_id, amount, notes, created_at) VALUES (?, ?, ?, ?)",
+                (int(sid), amount, form_text("notes") or "مبلغ سابق", now_str()))
+    con.commit()
+    con.close()
+    flash(f"أُضيف {money(amount)} د.ع على حساب {s['name']} ✅", "success")
+    return redirect(back)
+
+
+@app.route("/self-account/old/delete", methods=["POST"])
+@login_required
+def self_old_delete():
+    oid = request.form.get("id", "")
+    con = db()
+    row = con.execute("SELECT subscriber_id FROM self_old WHERE id = ? AND collected_at IS NULL", (oid,)).fetchone() if oid.isdigit() else None
+    if row:
+        con.execute("DELETE FROM self_old WHERE id = ?", (oid,))
+        con.commit()
+        flash("انحذف المبلغ السابق", "success")
+    con.close()
+    back = request.form.get("back") or ""
+    return redirect(back if back.startswith("/") and not back.startswith("//") else url_for("self_account"))
+
+
 @app.route("/self-account/collect", methods=["POST"])
 @login_required
 def self_collect():
@@ -2555,10 +2660,20 @@ def self_collect():
         # المبلغ الي رجّعه المشترك يرجع لمحفظة حساب الدفع من قبلي
         con.execute("INSERT INTO self_wallet (kind, amount, notes, activation_id, created_at) VALUES ('استلام', ?, ?, ?, ?)",
                     (o["retail_price"], f"استلام من {o['username']}", o["id"], now_str()))
+    n = len(ops)
+    if request.form.get("subscriber_id", "").isdigit():
+        olds = con.execute("""
+            SELECT o.id, o.amount, s.username FROM self_old o JOIN subscribers s ON s.id = o.subscriber_id
+            WHERE o.subscriber_id = ? AND o.collected_at IS NULL
+        """, (int(request.form["subscriber_id"]),)).fetchall()
+        for x in olds:
+            con.execute("UPDATE self_old SET collected_at = ? WHERE id = ?", (now, x["id"]))
+            con.execute("INSERT INTO self_wallet (kind, amount, notes, created_at) VALUES ('استلام', ?, ?, ?)",
+                        (x["amount"], f"مبلغ سابق من {x['username']}", now_str()))
+        n += len(olds)
     con.commit()
     con.close()
-    n = len(ops)
-    flash(f"تم تسجيل استلام {n} اشتراك ✅ — وربحه انحسب بحساب الدفع من قبلي" if n else "ما تغيّر شي",
+    flash(f"تم تسجيل استلام {n} مبلغ ✅ — ورجع لرصيد حساب الدفع من قبلي" if n else "ما تغيّر شي",
           "success" if n else "warning")
     back = request.form.get("back") or ""
     return redirect(back if back.startswith("/") and not back.startswith("//") else url_for("self_account"))
@@ -3820,7 +3935,7 @@ def settings():
                 dst = sqlite3.connect(bpath)
                 con.backup(dst)
                 dst.close()
-                for table in ("debts", "activations", "wallet_transactions", "subscribers", "self_wallet"):
+                for table in ("debts", "activations", "wallet_transactions", "subscribers", "self_wallet", "self_old"):
                     con.execute(f"DELETE FROM {table}")
                 if request.form.get("reset_plans") == "1":
                     con.execute("DELETE FROM plans")
