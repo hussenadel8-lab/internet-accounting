@@ -246,6 +246,18 @@ def init_db():
     if not column_exists(cur, "plans", "self_price"):
         cur.execute("ALTER TABLE plans ADD COLUMN self_price INTEGER")
 
+    # المبالغ السابقة تنخصم من محفظة حساب الدفع من قبلي (مربوطة بـ old_id)
+    if not column_exists(cur, "self_wallet", "old_id"):
+        cur.execute("ALTER TABLE self_wallet ADD COLUMN old_id INTEGER")
+        for o in cur.execute("""
+            SELECT o.id, o.amount, s.username FROM self_old o LEFT JOIN subscribers s ON s.id = o.subscriber_id
+        """).fetchall():
+            cur.execute("INSERT INTO self_wallet (kind, amount, notes, old_id, created_at) VALUES ('خصم', ?, ?, ?, ?)",
+                        (o["amount"], f"مبلغ سابق - {o['username'] or ''}", o["id"], now_str()))
+        cur.execute("UPDATE self_wallet SET old_id = (SELECT o.id FROM self_old o WHERE o.collected_at IS NOT NULL "
+                    "AND self_wallet.notes LIKE 'مبلغ سابق من %' AND o.amount = self_wallet.amount LIMIT 1) "
+                    "WHERE kind = 'استلام' AND notes LIKE 'مبلغ سابق من %'")
+
     # حالة الدفع لكل تفعيل: نقد (محصّل) / دين (معلّق) / من قبلي (دفعته من جيبي)
     # settled_at = وقت التحصيل نقداً أو التحويل لحسابي الخاص
     if not column_exists(cur, "activations", "settled_at"):
@@ -1891,7 +1903,7 @@ def subscriber_detail(subscriber_id):
 
     <div class="card p-4 mb-4">
         <h5><i class="bi bi-piggy-bank text-info"></i> إضافة مبلغ مطلوب سابقاً (حساب الدفع من قبلي)</h5>
-        <p class="text-muted small mb-2">مبلغ قديم بذمته إلك. ينضاف على حسابه بيوزرات الدفع من قبلي — حالياً بذمته: <b>{money(self_paid)} د.ع</b></p>
+        <p class="text-muted small mb-2">مبلغ قديم دافعه من قبلك. ينضاف على حسابه وينخصم من رصيد حساب الدفع من قبلي — حالياً بذمته: <b>{money(self_paid)} د.ع</b></p>
         <form method="post" action="{url_for('self_old_add')}" class="row g-2">
             <input type="hidden" name="subscriber_id" value="{subscriber_id}">
             <input type="hidden" name="back" value="{url_for('subscriber_detail', subscriber_id=subscriber_id)}">
@@ -1981,6 +1993,7 @@ def delete_subscriber(subscriber_id):
     con.execute("DELETE FROM debts WHERE subscriber_id = ?", (subscriber_id,))
     con.execute("DELETE FROM self_wallet WHERE activation_id IN (SELECT id FROM activations WHERE subscriber_id = ?)",
                 (subscriber_id,))
+    con.execute("DELETE FROM self_wallet WHERE old_id IN (SELECT id FROM self_old WHERE subscriber_id = ?)", (subscriber_id,))
     con.execute("DELETE FROM self_old WHERE subscriber_id = ?", (subscriber_id,))
     con.execute("DELETE FROM activations WHERE subscriber_id = ?", (subscriber_id,))
     con.execute("DELETE FROM subscribers WHERE id = ?", (subscriber_id,))
@@ -2422,6 +2435,17 @@ def self_account():
     all_subs = con.execute("SELECT id, name, username FROM subscribers ORDER BY name").fetchall()
     con.close()
     sub_options = "".join(f'<option value="{x["id"]}">{esc(x["name"])} — {esc(x["username"])}</option>' for x in all_subs)
+    old_pending = sum(x["amount"] for x in olds if not x["collected_at"])
+    old_got = sum(x["amount"] for x in olds if x["collected_at"])
+    old_rows = "".join(f"""
+        <tr>
+            <td><a href="{url_for('subscriber_detail', subscriber_id=x['subscriber_id'])}" class="text-decoration-none">{esc(x['name'])}</a></td>
+            <td dir="ltr">{esc(x['username'])}</td>
+            <td class="fw-bold">{money(x['amount'])} د.ع</td>
+            <td>{esc(x['notes'])}</td>
+            <td>{esc(x['created_at'][:10])}</td>
+            <td>{'<span class="badge bg-success">مستلم ✓</span>' if x['collected_at'] else '<span class="badge bg-secondary">غير مستلم</span>'}</td>
+        </tr>""" for x in reversed(olds))
     move_rows = "".join(f"""
         <tr>
             <td>{esc(m['kind'])}</td>
@@ -2534,17 +2558,27 @@ def self_account():
         </form>
     </div>
 
-    <div class="card p-4 mb-4">
-        <h5><i class="bi bi-clock-history text-secondary"></i> إضافة مبلغ مطلوب سابقاً</h5>
-        <p class="text-muted small">مبلغ قديم بذمة المشترك (من قبل البرنامج). ينضاف على حسابه بدون خصم من الرصيد،
-        ولما تضغط <b>استلمت الكل</b> يرجع المبلغ للرصيد.</p>
-        <form method="post" action="{url_for('self_old_add')}" class="row g-2">
+    <div class="card p-4 mb-4" style="border:2px solid #64748b">
+        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+            <h5 class="mb-0"><i class="bi bi-clock-history text-secondary"></i> المطلوبين سابقاً</h5>
+            <div><span class="badge bg-secondary fs-6">غير مستلم: {money(old_pending)} د.ع</span>
+                 <span class="badge bg-success-subtle text-success-emphasis fs-6">مستلم: {money(old_got)} د.ع</span></div>
+        </div>
+        <p class="text-muted small">مبالغ قديمة دافعها من قبلك (قبل البرنامج). لما تضيفها <b>تنخصم من رصيد هذا الحساب</b>،
+        ولما المشترك يرجّعها (<b>استلمت الكل</b>) ترجع للرصيد.</p>
+        <form method="post" action="{url_for('self_old_add')}" class="row g-2 mb-3">
             <div class="col-md-5"><select name="subscriber_id" class="form-select" required>
                 <option value="">اختار المشترك</option>{sub_options}</select></div>
             <div class="col-6 col-md-2"><input type="number" name="amount" min="1" class="form-control" placeholder="المبلغ" required></div>
             <div class="col-6 col-md-3"><input name="notes" class="form-control" placeholder="ملاحظة (مثلاً: دين قديم)"></div>
             <div class="col-md-2"><button class="btn btn-secondary w-100">إضافة</button></div>
         </form>
+        <div class="table-responsive">
+            <table class="table">
+                <thead><tr><th>الاسم</th><th>اليوزر</th><th>المبلغ</th><th>الملاحظة</th><th>تاريخ الإضافة</th><th>الحالة</th></tr></thead>
+                <tbody>{old_rows or '<tr><td colspan="6" class="text-muted text-center">ماكو مطلوبين سابقاً</td></tr>'}</tbody>
+            </table>
+        </div>
     </div>
 
     <div class="alert alert-info small">
@@ -2618,11 +2652,15 @@ def self_old_add():
         con.close()
         flash("اختار المشترك واكتب مبلغ صحيح", "danger")
         return redirect(back)
-    con.execute("INSERT INTO self_old (subscriber_id, amount, notes, created_at) VALUES (?, ?, ?, ?)",
-                (int(sid), amount, form_text("notes") or "مبلغ سابق", now_str()))
+    cur = con.execute("INSERT INTO self_old (subscriber_id, amount, notes, created_at) VALUES (?, ?, ?, ?)",
+                      (int(sid), amount, form_text("notes") or "مبلغ سابق", now_str()))
+    # طالع من جيبك سابقاً: ينخصم من رصيد حساب الدفع من قبلي
+    con.execute("INSERT INTO self_wallet (kind, amount, notes, old_id, created_at) VALUES ('خصم', ?, ?, ?, ?)",
+                (amount, f"مبلغ سابق - {s['name']}", cur.lastrowid, now_str()))
     con.commit()
+    bal = self_wallet_balance(con)
     con.close()
-    flash(f"أُضيف {money(amount)} د.ع على حساب {s['name']} ✅", "success")
+    flash(f"أُضيف {money(amount)} د.ع على حساب {s['name']} وانخصم من رصيد الحساب (الرصيد: {money(bal)} د.ع) ✅", "success")
     return redirect(back)
 
 
@@ -2634,8 +2672,9 @@ def self_old_delete():
     row = con.execute("SELECT subscriber_id FROM self_old WHERE id = ? AND collected_at IS NULL", (oid,)).fetchone() if oid.isdigit() else None
     if row:
         con.execute("DELETE FROM self_old WHERE id = ?", (oid,))
+        con.execute("DELETE FROM self_wallet WHERE old_id = ?", (oid,))
         con.commit()
-        flash("انحذف المبلغ السابق", "success")
+        flash("انحذف المبلغ السابق ورجع لرصيد الحساب", "success")
     con.close()
     back = request.form.get("back") or ""
     return redirect(back if back.startswith("/") and not back.startswith("//") else url_for("self_account"))
@@ -2668,8 +2707,8 @@ def self_collect():
         """, (int(request.form["subscriber_id"]),)).fetchall()
         for x in olds:
             con.execute("UPDATE self_old SET collected_at = ? WHERE id = ?", (now, x["id"]))
-            con.execute("INSERT INTO self_wallet (kind, amount, notes, created_at) VALUES ('استلام', ?, ?, ?)",
-                        (x["amount"], f"مبلغ سابق من {x['username']}", now_str()))
+            con.execute("INSERT INTO self_wallet (kind, amount, notes, old_id, created_at) VALUES ('استلام', ?, ?, ?, ?)",
+                        (x["amount"], f"مبلغ سابق من {x['username']}", x["id"], now_str()))
         n += len(olds)
     con.commit()
     con.close()
