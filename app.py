@@ -41,15 +41,16 @@ PROFIT = 5000              # الربح الافتراضي للباقات الج
 SUBSCRIPTION_DAYS = 30     # مدة الاشتراك بالأيام
 EXPIRY_WARNING_DAYS = 3    # التنبيه قبل انتهاء الاشتراك بهذه الأيام
 
+# (الفئة، الباقة، سعر البيع، سعر الجملة "يخصم من المحفظة"، سعر "من قبلي"، أسماء الكارت بملف الشركة)
 PLANS = [
-    ("فايبر", "فايبر 35", 36000),
-    ("فايبر", "فايبر 50", 45000),
-    ("فايبر", "فايبر 75", 65000),
-    ("فايبر", "فايبر 150", 100000),
-    ("وايرليس", "إيكو", 36000),
-    ("وايرليس", "بلص", 38000),
-    ("وايرليس", "استاندر", 46000),
-    ("وايرليس", "اكتف", 66000),
+    ("فايبر", "Basic", 38000, 32000, 40000, ["basic"]),
+    ("فايبر", "Plus", 45000, 39000, 45000, ["plus"]),
+    ("فايبر", "Turbo", 65000, 58000, 65000, ["turbo"]),
+    ("فايبر", "Pro Max", 100000, 90000, 100000, ["pro max", "promax", "pro-max"]),
+    ("وايرليس", "ايكو", 36000, 31000, 36000, ["economy", "eco", "eco-w", "economy-w"]),
+    ("وايرليس", "بلص", 38000, 33000, 38000, ["plus-w"]),
+    ("وايرليس", "استاندر", 45000, 40000, 45000, ["standard", "standard-w"]),
+    ("وايرليس", "تيربو", 65000, 60000, 65000, ["turbo-w"]),
 ]
 
 
@@ -68,6 +69,11 @@ def money(value):
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def precise_now():
+    """وقت دقيق (بالأجزاء من الثانية) لترتيب التحصيل والشحن."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
 def today_str():
@@ -208,6 +214,10 @@ def init_db():
 
     cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 
+    # سعر البيع عند "من قبلي" لكل باقة
+    if not column_exists(cur, "plans", "self_price"):
+        cur.execute("ALTER TABLE plans ADD COLUMN self_price INTEGER")
+
     # حالة الدفع لكل تفعيل: نقد (محصّل) / دين (معلّق) / من قبلي (دفعته من جيبي)
     # settled_at = وقت التحصيل نقداً أو التحويل لحسابي الخاص
     if not column_exists(cur, "activations", "settled_at"):
@@ -238,14 +248,19 @@ def init_db():
 
     count = cur.execute("SELECT COUNT(*) AS c FROM plans").fetchone()["c"]
     if count == 0:
-        for category, name, retail_price in PLANS:
-            cur.execute("""
-                INSERT INTO plans (category, name, retail_price, profit, wholesale_price)
-                VALUES (?, ?, ?, ?, ?)
-            """, (category, name, retail_price, PROFIT, retail_price - PROFIT))
+        seed_plans(cur)
 
     con.commit()
     con.close()
+
+
+def seed_plans(cur):
+    """إضافة قائمة الباقات الافتراضية."""
+    for category, name, retail, wholesale, self_price, _ in PLANS:
+        cur.execute("""
+            INSERT INTO plans (category, name, retail_price, profit, wholesale_price, self_price)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (category, name, retail, retail - wholesale, wholesale, self_price))
 
 
 def expiry_from(start_date):
@@ -269,14 +284,19 @@ def status_badge(expiry_date):
 PAY_CASH, PAY_DEBT, PAY_SELF = "نقد", "دين", "من قبلي"
 PAY_TYPES = (PAY_CASH, PAY_DEBT, PAY_SELF)
 
+def self_price_of(plan):
+    """سعر البيع عند الدفع "من قبلي" (إذا ما محدد = سعر البيع)."""
+    return plan["self_price"] or plan["retail_price"]
+
+
 # دين المشترك = مجموع أسعار البيع للتفعيلات الي حالتها دين (داخل استعلام فيه s = المشتركين)
 DEBT_SUBQUERY = """
     SELECT COALESCE(SUM(a.retail_price), 0) FROM activations a
     WHERE a.subscriber_id = s.id AND a.payment_type = 'دين'
 """
-# المدفوع من جيبي لهذا المشترك = مجموع أسعار الجملة للتفعيلات "من قبلي"
+# المسدد من قبلي لهذا المشترك = مجموع أسعار التفعيلات "من قبلي"
 SELF_SUBQUERY = """
-    SELECT COALESCE(SUM(a.amount), 0) FROM activations a
+    SELECT COALESCE(SUM(a.retail_price), 0) FROM activations a
     WHERE a.subscriber_id = s.id AND a.payment_type = 'من قبلي'
 """
 
@@ -294,7 +314,8 @@ def record_previous(con, subscriber_id, plan_id, start, retail, payment_type, wh
                    (subscriber_id, start)).fetchone():
         return False
     wholesale = plan["wholesale_price"] if wholesale is None else wholesale
-    retail = plan["retail_price"] if retail is None else retail
+    if retail is None:
+        retail = self_price_of(plan) if payment_type == PAY_SELF else plan["retail_price"]
     when = f"{start} 00:00:00"
     con.execute("""
         INSERT INTO activations
@@ -311,12 +332,11 @@ def record_previous(con, subscriber_id, plan_id, start, retail, payment_type, wh
     return True
 
 
-def quick_prices(con, retail=None):
-    """أسعار البيع السريعة (من الإعدادات) + سعر الباقة."""
-    raw = get_setting(con, "quick_prices", "38000,40000")
+def quick_prices(con, *extra):
+    """أسعار البيع السريعة (من الإعدادات) + سعر الباقة وسعر من قبلي."""
+    raw = get_setting(con, "quick_prices", "")
     prices = {parse_amount(x) for x in raw.split(",")}
-    if retail:
-        prices.add(retail)
+    prices.update(e for e in extra if e)
     return sorted(p for p in prices if p and p > 0)
 
 
@@ -739,7 +759,7 @@ BASE_HTML = """
 {% set titles = {
     'dashboard': 'الرئيسية', 'subscribers': 'المشتركون', 'subscriber_detail': 'تفاصيل المشترك',
     'wallet': 'المحفظة', 'plans': 'الباقات والأسعار', 'reports': 'التقارير',
-    'settings': 'الإعدادات', 'debts': 'الديون والجيب الخاص', 'settle_operation': 'ترحيل', 'import_users': 'استيراد اليوزرات', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل'
+    'settings': 'الإعدادات', 'debts': 'الديون ومسددين من قبلي', 'settle_operation': 'ترحيل', 'import_users': 'استيراد اليوزرات', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل'
 } %}
 {% set ep = request.endpoint %}
 
@@ -936,7 +956,10 @@ def logout():
 # ---------------------------------------------------------------------------
 
 def money_totals(con, since=None, until=None):
-    """مجاميع الحسابات: المحصّل نقداً والأرباح (حسب تاريخ التحصيل)، والجيب الخاص، والديون الحالية."""
+    """مجاميع الحسابات حسب تاريخ الاستلام/الترحيل:
+    - المحصّل = مبالغ النقد + مبالغ "من قبلي"
+    - الأرباح = من النقد فقط
+    - الديون = الحالية (كل الفترات)"""
     cond, params = "", []
     if since:
         cond += " AND settled_at >= ?"
@@ -945,20 +968,36 @@ def money_totals(con, since=None, until=None):
         cond += " AND settled_at <= ?"
         params.append(until)
     cash = con.execute(f"""
-        SELECT COUNT(*) AS n, COALESCE(SUM(retail_price), 0) AS collected, COALESCE(SUM(profit), 0) AS profit
+        SELECT COUNT(*) AS n, COALESCE(SUM(retail_price), 0) AS total, COALESCE(SUM(profit), 0) AS profit
         FROM activations WHERE payment_type = 'نقد' {cond}
     """, params).fetchone()
-    pocket = con.execute(f"""
-        SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total
+    mine = con.execute(f"""
+        SELECT COUNT(*) AS n, COALESCE(SUM(retail_price), 0) AS total
         FROM activations WHERE payment_type = 'من قبلي' {cond}
     """, params).fetchone()
     debt = con.execute("""
         SELECT COUNT(DISTINCT subscriber_id) AS n, COALESCE(SUM(retail_price), 0) AS total
         FROM activations WHERE payment_type = 'دين'
     """).fetchone()
-    return {"cash_n": cash["n"], "collected": cash["collected"], "profit": cash["profit"],
-            "pocket_n": pocket["n"], "pocket": pocket["total"],
+    return {"cash_n": cash["n"], "cash": cash["total"], "profit": cash["profit"],
+            "self_n": mine["n"], "self": mine["total"],
+            "collected": cash["total"] + mine["total"], "collected_n": cash["n"] + mine["n"],
             "debt_n": debt["n"], "debt": debt["total"]}
+
+
+def last_charge_time(con):
+    """وقت آخر شحن (يتسجل بدقة وقت الشحن حتى يتصفر التحصيل)."""
+    marker = get_setting(con, "collection_reset_at")
+    if marker:
+        return marker
+    row = con.execute("SELECT MAX(created_at) AS t FROM wallet_transactions WHERE transaction_type = 'شحن'").fetchone()
+    return row["t"]
+
+
+def collection_since_charge(con):
+    """تحصيل المبالغ منذ آخر شحن للمحفظة (يتصفر مع كل شحن)."""
+    last = last_charge_time(con)
+    return money_totals(con, since=last), last
 
 
 def stat_card(title, value, icon, color, sub="", href=None, cls="col-6 col-md-4"):
@@ -1005,6 +1044,7 @@ def dashboard():
 
     balance = wallet_balance(con)
     shop = get_setting(con, "shop_name")
+    since, last_charge = collection_since_charge(con)
     con.close()
 
     expiring_rows = "".join(f"""
@@ -1040,14 +1080,17 @@ def dashboard():
                 <small>{subscribers_count} مشترك — {month_ops} تفعيل هذا الشهر</small>
             </div>
         </div>""",
+        stat_card("تحصيل المبالغ", f"{money(since['collected'])} د.ع", "bi-cash-stack", "#4f46e5",
+                  f"منذ آخر شحن ({esc((last_charge or 'البداية')[:16])}) — نقد {money(since['cash'])} + من قبلي {money(since['self'])}",
+                  url_for("wallet")),
         stat_card("الأرباح هذا الشهر", f"{money(month['profit'])} د.ع", "bi-graph-up-arrow", "#10b981",
-                  f"الإجمالي: {money(total['profit'])} د.ع"),
-        stat_card("مجموع مبالغ الاشتراكات", f"{money(month['collected'])} د.ع", "bi-cash-stack", "#4f46e5",
-                  f"المحصّل نقداً هذا الشهر — الإجمالي: {money(total['collected'])}"),
-        stat_card("الدفع من الجيب الخاص", f"{money(month['pocket'])} د.ع", "bi-piggy-bank", "#0ea5e9",
-                  f"هذا الشهر — الإجمالي: {money(total['pocket'])} ({total['pocket_n']} عملية)", url_for("debts")),
+                  f"من النقد فقط — الإجمالي: {money(total['profit'])} د.ع"),
+        stat_card("مجموع مبالغ الاشتراكات", f"{money(month['collected'])} د.ع", "bi-collection", "#7c3aed",
+                  f"هذا الشهر — الإجمالي: {money(total['collected'])}"),
+        stat_card("مسددين من قبلي", f"{money(total['self'])} د.ع", "bi-piggy-bank", "#0ea5e9",
+                  f"{total['self_n']} عملية — بدون أرباح", url_for("debts")),
         stat_card("الديون", f"{money(total['debt'])} د.ع", "bi-journal-text", "#ef4444",
-                  f"على {total['debt_n']} مشترك", url_for("debts"), cls="col-12 col-md-4"),
+                  f"على {total['debt_n']} مشترك", url_for("debts")),
     ])
 
     body = f"""
@@ -1103,19 +1146,28 @@ def wallet():
             flash("الرصيد غير كافٍ لهذا الخصم", "danger")
             return redirect(url_for("wallet"))
 
+        before = collection_since_charge(con)[0]["collected"] if kind == "شحن" else 0
+        if kind == "شحن":
+            notes = (notes + " — " if notes else "") + f"التحصيل قبل الشحن: {money(before)}"
         con.execute("""
             INSERT INTO wallet_transactions (transaction_type, amount, notes, created_at)
             VALUES (?, ?, ?, ?)
-        """, (kind, amount, notes or ("خصم يدوي" if kind == "خصم" else ""), now_str()))
+        """, (kind, amount, notes or "خصم يدوي", now_str()))
+        if kind == "شحن":
+            set_setting(con, "collection_reset_at", precise_now())
         con.commit()
         con.close()
 
-        flash("تم شحن المحفظة بنجاح" if kind == "شحن" else "تم خصم المبلغ من المحفظة", "success")
+        if kind == "شحن":
+            flash(f"تم شحن المحفظة بنجاح — وتصفّر تحصيل المبالغ (جان {money(before)} د.ع)", "success")
+        else:
+            flash("تم خصم المبلغ من المحفظة", "success")
         return redirect(url_for("wallet"))
 
     con = db()
     transactions = con.execute("SELECT * FROM wallet_transactions ORDER BY id DESC LIMIT 500").fetchall()
     balance = wallet_balance(con)
+    since, last_charge = collection_since_charge(con)
     con.close()
 
     rows = ""
@@ -1134,6 +1186,12 @@ def wallet():
 
     <div class="card p-4 mb-4">
         <h4>الرصيد الحالي: <span class="text-success">{money(balance)} د.ع</span></h4>
+        <div class="alert mt-2 mb-0" style="background:var(--primary-soft)">
+            <i class="bi bi-cash-stack"></i> تحصيل المبالغ منذ آخر شحن ({esc((last_charge or 'البداية')[:16])}):
+            <b>{money(since['collected'])} د.ع</b>
+            <small class="text-muted">(نقد {money(since['cash'])} + من قبلي {money(since['self'])})</small>
+            — يتصفر تلقائياً لما تشحن.
+        </div>
 
         <form method="post" class="row g-3 mt-2">
             <div class="col-md-2">
@@ -1179,7 +1237,7 @@ def plan_options(plans, selected_id=None):
     for plan in plans:
         sel = "selected" if selected_id is not None and plan["id"] == selected_id else ""
         html += f"""
-        <option value="{plan['id']}" data-retail="{plan['retail_price']}" data-wholesale="{plan['wholesale_price']}" {sel}>
+        <option value="{plan['id']}" data-retail="{plan['retail_price']}" data-wholesale="{plan['wholesale_price']}" data-self="{self_price_of(plan)}" {sel}>
             {esc(plan['category'])} - {esc(plan['name'])}
             | البيع {money(plan['retail_price'])}
             | الجملة {money(plan['wholesale_price'])}
@@ -1274,7 +1332,7 @@ def pay_choice_html(selected=PAY_CASH, prefix=""):
     opts = [
         (PAY_CASH, "cash", "bi-cash-coin", "نقداً", "استلمت المبلغ"),
         (PAY_DEBT, "debt", "bi-journal-text", "دين", "بذمة المشترك"),
-        (PAY_SELF, "self", "bi-piggy-bank", "من قبلي", "دفعته من جيبي"),
+        (PAY_SELF, "self", "bi-piggy-bank", "من قبلي", "سددته عنه"),
     ]
     html = '<div class="pay-options">'
     for value, cls, icon, title, sub in opts:
@@ -1314,19 +1372,26 @@ PAY_CALC_JS = """
                 f.dataset.lastPlan = sel.value;
             }
         }
-        const price = +f.retail_price.value || 0;
         const t = (f.querySelector('input[name=payment_type]:checked') || {}).value;
+        // "من قبلي" له سعر خاص (مثلاً 40,000)، والنقد/الدين بسعر البيع العادي
+        const src = (o && o.dataset.wholesale) ? o.dataset : f.dataset;
+        if (t && f.dataset.lastType !== undefined && f.dataset.lastType !== t && src.retail) {
+            if (t === 'من قبلي') f.retail_price.value = src.self || src.retail;
+            else if (f.dataset.lastType === 'من قبلي') f.retail_price.value = src.retail;
+        }
+        f.dataset.lastType = t || '';
+        const price = +f.retail_price.value || 0;
         const out = f.querySelector('.pay-summary');
         const profit = price - wholesale;
         if (t === 'نقد') {
-            out.innerHTML = '✅ يُضاف <b>' + fmt(price) + '</b> لمجموع مبالغ الاشتراكات، وربح <b class="' +
+            out.innerHTML = '✅ يُضاف <b>' + fmt(price) + '</b> لتحصيل المبالغ، وربح <b class="' +
                 (profit < 0 ? 'text-danger' : 'text-success') + '">' + fmt(profit) + ' د.ع</b> للأرباح';
         } else if (t === 'دين') {
             out.innerHTML = '📒 يُضاف <b class="text-danger">' + fmt(price) +
                 ' د.ع</b> لحساب الديون — الربح ينحسب لما تستلم المبلغ (ترحيل)';
         } else {
-            out.innerHTML = '🐷 يُحسب <b>' + fmt(wholesale) +
-                ' د.ع</b> (سعر الجملة) على جيبك الخاص — بدون أرباح';
+            out.innerHTML = '🐷 من قبلي: يُضاف <b>' + fmt(price) +
+                ' د.ع</b> لتحصيل المبالغ ولقائمة مسددين من قبلي — <b>بدون أرباح</b>';
         }
     }
     document.querySelectorAll('form.pay-form').forEach(payCalc);
@@ -1576,7 +1641,7 @@ def bulk_previous():
 def get_subscriber(con, subscriber_id):
     return con.execute(f"""
         SELECT s.*, p.name AS plan_name, p.category,
-               p.retail_price, p.wholesale_price, p.profit,
+               p.retail_price, p.wholesale_price, p.profit, p.self_price,
                ({DEBT_SUBQUERY}) AS debt, ({SELF_SUBQUERY}) AS self_paid
         FROM subscribers s
         JOIN plans p ON p.id = s.plan_id
@@ -1619,7 +1684,7 @@ def subscriber_detail(subscriber_id):
         WHERE a.subscriber_id = ? ORDER BY a.id DESC
     """, (subscriber_id,)).fetchall()
     shop = get_setting(con, "shop_name")
-    prev_prices = quick_prices(con, s["retail_price"])
+    prev_prices = quick_prices(con, s["retail_price"], s["self_price"])
 
     # رسالة تأكيد بعد عملية تفعيل مباشرة
     done_html = ""
@@ -1869,7 +1934,7 @@ def perform_activation(subscriber_id):
         VALUES (?, ?, 'تفعيل', ?, ?, ?, ?, ?, ?, ?, ?)
     """, (subscriber_id, plan_id, amount, retail, retail - amount, payment_type,
           retail if payment_type == PAY_CASH else 0,
-          None if payment_type == PAY_DEBT else now, notes, now))
+          None if payment_type == PAY_DEBT else precise_now(), notes, now))
     activation_id = cur.lastrowid
 
     con.execute("""
@@ -1885,7 +1950,7 @@ def perform_activation(subscriber_id):
     msg = (f"تم تفعيل {subscriber['username']} لغاية {new_expiry} وخصم {money(amount)} د.ع من المحفظة — ")
     msg += {PAY_CASH: f"نقداً: ربح {money(retail - amount)} د.ع",
             PAY_DEBT: f"دين: أُضيف {money(retail)} د.ع لحساب الديون",
-            PAY_SELF: f"من قبلي: {money(amount)} د.ع على جيبك الخاص"}[payment_type]
+            PAY_SELF: f"من قبلي: أُضيف {money(retail)} د.ع لتحصيل المبالغ (بدون أرباح)"}[payment_type]
     flash(msg, "success")
     return redirect(url_for("subscriber_detail", subscriber_id=subscriber_id, done=activation_id))
 
@@ -1904,7 +1969,7 @@ def activate(subscriber_id):
         return redirect(url_for("subscribers"))
     plans_list = con.execute("SELECT * FROM plans ORDER BY category, id").fetchall()
     balance = wallet_balance(con)
-    prices = quick_prices(con, subscriber["retail_price"])
+    prices = quick_prices(con, subscriber["retail_price"], subscriber["self_price"])
     con.close()
 
     low = balance < subscriber["wholesale_price"]
@@ -1969,7 +2034,8 @@ def settle_card(op, prices, next_url):
                 <small class="text-muted fs-6">— {esc(op['operation_date'][:10])}</small></h5>
             <div>الحالة الحالية: {payment_badge(op['payment_type'])}</div>
         </div>
-        <form method="post" action="{url_for('settle_operation', op_id=op['id'])}" class="pay-form" data-wholesale="{op['amount']}">
+        <form method="post" action="{url_for('settle_operation', op_id=op['id'])}" class="pay-form"
+              data-wholesale="{op['amount']}" data-retail="{op['plan_retail']}" data-self="{op['plan_self'] or op['plan_retail']}">
             <input type="hidden" name="next" value="{esc(next_url)}">
             <div class="text-muted small mb-2">سعر الجملة: <b>{money(op['amount'])} د.ع</b></div>
             {price_field_html(op['retail_price'], prices)}
@@ -1991,14 +2057,14 @@ def transfer(subscriber_id):
         flash("المشترك غير موجود", "danger")
         return redirect(url_for("subscribers"))
     ops = con.execute("""
-        SELECT a.*, p.name AS plan_name FROM activations a JOIN plans p ON p.id = a.plan_id
+        SELECT a.*, p.name AS plan_name, p.retail_price AS plan_retail, p.self_price AS plan_self FROM activations a JOIN plans p ON p.id = a.plan_id
         WHERE a.subscriber_id = ? AND a.payment_type <> 'نقد' ORDER BY a.id
     """, (subscriber_id,)).fetchall()
     last = con.execute("""
-        SELECT a.*, p.name AS plan_name FROM activations a JOIN plans p ON p.id = a.plan_id
+        SELECT a.*, p.name AS plan_name, p.retail_price AS plan_retail, p.self_price AS plan_self FROM activations a JOIN plans p ON p.id = a.plan_id
         WHERE a.subscriber_id = ? ORDER BY a.id DESC LIMIT 1
     """, (subscriber_id,)).fetchone()
-    prices = quick_prices(con, s["retail_price"])
+    prices = quick_prices(con, s["retail_price"], s["self_price"])
     con.close()
 
     here = url_for("transfer", subscriber_id=subscriber_id)
@@ -2034,7 +2100,7 @@ def transfer(subscriber_id):
 def settle_operation(op_id):
     con = db()
     op = con.execute("""
-        SELECT a.*, p.name AS plan_name, s.name AS sub_name, s.username
+        SELECT a.*, p.name AS plan_name, p.retail_price AS plan_retail, p.self_price AS plan_self, s.name AS sub_name, s.username
         FROM activations a JOIN plans p ON p.id = a.plan_id
         JOIN subscribers s ON s.id = a.subscriber_id WHERE a.id = ?
     """, (op_id,)).fetchone()
@@ -2058,7 +2124,7 @@ def settle_operation(op_id):
         elif new_type == op["payment_type"] and op["settled_at"]:
             settled = op["settled_at"]
         else:
-            settled = now_str()
+            settled = precise_now()
         con.execute("""
             UPDATE activations SET payment_type = ?, retail_price = ?, profit = ?,
                    paid_amount = ?, settled_at = ?
@@ -2069,11 +2135,11 @@ def settle_operation(op_id):
         con.close()
         msg = {PAY_CASH: f"تم الترحيل: استلام {money(retail)} د.ع نقداً — ربح {money(retail - op['amount'])} د.ع",
                PAY_DEBT: f"تم الترحيل: {money(retail)} د.ع صارت دين على {op['sub_name']}",
-               PAY_SELF: f"تم الترحيل: {money(op['amount'])} د.ع على جيبك الخاص (بدون أرباح)"}[new_type]
+               PAY_SELF: f"تم الترحيل: من قبلي {money(retail)} د.ع — أُضيف لتحصيل المبالغ (بدون أرباح)"}[new_type]
         flash(msg, "success")
         return redirect(nxt)
 
-    prices = quick_prices(con, op["retail_price"])
+    prices = quick_prices(con, op["retail_price"], op["plan_retail"], op["plan_self"])
     con.close()
     body = f"""
     <h2 class="mb-4">ترحيل / تعديل حالة الدفع</h2>
@@ -2101,18 +2167,15 @@ def debts():
         WHERE a.payment_type IN ('دين', 'من قبلي')
         ORDER BY a.operation_date DESC
     """).fetchall()
-    month_start = date.today().replace(day=1).strftime("%Y-%m-%d")
-    collected = con.execute("""
-        SELECT COALESCE(SUM(retail_price), 0) AS c FROM activations
-        WHERE payment_type = 'نقد' AND settled_at >= ?
-    """, (month_start,)).fetchone()["c"]
+    since, _ = collection_since_charge(con)
+    collected = since["collected"]
     shop = get_setting(con, "shop_name")
     con.close()
 
     debt_ops = [o for o in pending if o["payment_type"] == PAY_DEBT]
     self_ops = [o for o in pending if o["payment_type"] == PAY_SELF]
     total_debt = sum(o["retail_price"] or 0 for o in debt_ops)
-    total_self = sum(o["amount"] or 0 for o in self_ops)
+    total_self = sum(o["retail_price"] or 0 for o in self_ops)
     debt_by_sub = {}
     for o in debt_ops:
         debt_by_sub[o["subscriber_id"]] = debt_by_sub.get(o["subscriber_id"], 0) + (o["retail_price"] or 0)
@@ -2120,7 +2183,7 @@ def debts():
     def rows(ops, kind):
         html = ""
         for o in ops:
-            amount = o["retail_price"] if kind == PAY_DEBT else o["amount"]
+            amount = o["retail_price"]
             wa = wa_button(o["phone"], msg_debt(o, debt_by_sub.get(o["subscriber_id"], 0), shop), '') if kind == PAY_DEBT else ""
             html += f"""
             <tr>
@@ -2137,7 +2200,7 @@ def debts():
         return html
 
     body = f"""
-    <h2 class="mb-4">الديون والجيب الخاص</h2>
+    <h2 class="mb-4">الديون ومسددين من قبلي</h2>
 
     <div class="row g-3 mb-4">
         <div class="col-6 col-md-4">
@@ -2151,15 +2214,15 @@ def debts():
         <div class="col-6 col-md-4">
             <div class="card stat-card p-4">
                 <span class="stat-icon" style="background:rgba(14,165,233,.14);color:#0ea5e9"><i class="bi bi-piggy-bank"></i></span>
-                <h6>الدفع من الجيب الخاص</h6>
+                <h6>مسددين من قبلي</h6>
                 <h2 class="text-info">{money(total_self)} د.ع</h2>
-                <small class="text-muted">{len(self_ops)} عملية (سعر الجملة)</small>
+                <small class="text-muted">{len(self_ops)} عملية — بدون أرباح</small>
             </div>
         </div>
         <div class="col-12 col-md-4">
             <div class="card stat-card p-4">
                 <span class="stat-icon" style="background:rgba(16,185,129,.14);color:#10b981"><i class="bi bi-cash-stack"></i></span>
-                <h6>المحصّل نقداً هذا الشهر</h6>
+                <h6>تحصيل المبالغ منذ آخر شحن</h6>
                 <h2 class="text-success">{money(collected)} د.ع</h2>
             </div>
         </div>
@@ -2177,11 +2240,11 @@ def debts():
     </div>
 
     <div class="card p-4">
-        <h5><i class="bi bi-piggy-bank text-info"></i> الدفع من الجيب الخاص (من قبلي)</h5>
-        <p class="text-muted small">هذي اليوزرات دفعتها من جيبك — محسوبة بسعر الجملة وبدون أرباح. إذا استلمت منهم بعدين اضغط <b>ترحيل</b> واختار <b>نقداً</b>.</p>
+        <h5><i class="bi bi-piggy-bank text-info"></i> مسددين من قبلي</h5>
+        <p class="text-muted small">هذي اليوزرات سددتها من قبلك (بسعر من قبلي) — مضافة لتحصيل المبالغ وبدون أرباح.</p>
         <div class="table-responsive">
             <table class="table table-hover">
-                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الباقة</th><th>الجملة</th><th>تاريخ التفعيل</th><th></th></tr></thead>
+                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الباقة</th><th>المبلغ</th><th>تاريخ التفعيل</th><th></th></tr></thead>
                 <tbody>{rows(self_ops, PAY_SELF) or '<tr><td colspan="6" class="text-muted text-center">لا يوجد</td></tr>'}</tbody>
             </table>
         </div>
@@ -2342,32 +2405,17 @@ def parse_company_pdf(data):
     return rows
 
 
-PLAN_ALIASES = {
-    "economy": ["إيكو", "ايكو", "economy"],
-    "plus": ["بلص", "بلس", "plus"],
-    "standard": ["استاندر", "ستاندر", "standard"],
-    "active": ["اكتف", "active"],
-    "basic": ["بيسك", "basic"],
-}
-
-
 def guess_plan(card_type, plans_list):
-    """تخمين الباقة المطابقة لنوع الكارت."""
-    ct = card_type.lower().strip()
+    """تخمين الباقة المطابقة لنوع الكارت بملف الشركة."""
+    ct = " ".join(card_type.lower().split())
     for p in plans_list:
         if p["name"].lower().strip() == ct:
             return p["id"]
-    num = re.search(r"\d+", ct)
-    if "fiber" in ct and num:
-        for p in plans_list:
-            if "فايبر" in p["name"] and re.search(rf"\b{num.group(0)}\b", p["name"]):
-                return p["id"]
-    if not ct.endswith("-w"):
-        for key, names in PLAN_ALIASES.items():
-            if ct == key:
-                for p in plans_list:
-                    if p["name"].strip().lower() in names:
-                        return p["id"]
+    for category, name, *_rest, aliases in PLANS:
+        if ct in aliases:
+            for p in plans_list:
+                if p["name"] == name and p["category"] == category:
+                    return p["id"]
     return "new"
 
 
@@ -2679,7 +2727,10 @@ def read_plan_form():
         return None, "أدخل أسعاراً صحيحة"
     if wholesale > retail:
         return None, "سعر الجملة لا يمكن أن يكون أكبر من سعر البيع"
-    return (category, name, retail, retail - wholesale, wholesale), None
+    self_price = parse_amount(request.form.get("self_price"))
+    if self_price is None or self_price <= 0:
+        self_price = retail
+    return (category, name, retail, retail - wholesale, wholesale, self_price), None
 
 
 @app.route("/plans", methods=["GET", "POST"])
@@ -2695,14 +2746,15 @@ def plans():
             plan_id = request.form.get("plan_id")
             if plan_id:
                 con.execute("""
-                    UPDATE plans SET category = ?, name = ?, retail_price = ?, profit = ?, wholesale_price = ?
+                    UPDATE plans SET category = ?, name = ?, retail_price = ?, profit = ?, wholesale_price = ?,
+                           self_price = ?
                     WHERE id = ?
                 """, (*values, plan_id))
                 flash("تم تعديل الباقة (العمليات القديمة تبقى بأسعارها الأصلية)", "success")
             else:
                 con.execute("""
-                    INSERT INTO plans (category, name, retail_price, profit, wholesale_price)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO plans (category, name, retail_price, profit, wholesale_price, self_price)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 """, values)
                 flash("تمت إضافة الباقة", "success")
             con.commit()
@@ -2730,6 +2782,7 @@ def plans():
             <td><input form="{fid}" name="name" value="{esc(p['name'])}" class="form-control form-control-sm" required></td>
             <td><input form="{fid}" name="retail_price" type="number" min="0" value="{p['retail_price']}" class="form-control form-control-sm" required></td>
             <td><input form="{fid}" name="wholesale_price" type="number" min="0" value="{p['wholesale_price']}" class="form-control form-control-sm" required></td>
+            <td><input form="{fid}" name="self_price" type="number" min="0" value="{self_price_of(p)}" class="form-control form-control-sm"></td>
             <td class="text-success">{money(p['profit'])}</td>
             <td>{p['subs']}</td>
             <td class="text-nowrap">
@@ -2746,23 +2799,25 @@ def plans():
     <div class="card p-4 mb-4">
         <h5>إضافة باقة جديدة</h5>
         <form method="post" class="row g-3 mt-1">
-            <div class="col-md-3"><label class="form-label">الفئة</label>
+            <div class="col-md-2"><label class="form-label">الفئة</label>
                 <input name="category" class="form-control" placeholder="فايبر / وايرليس" required></div>
-            <div class="col-md-3"><label class="form-label">اسم الباقة</label>
+            <div class="col-md-2"><label class="form-label">اسم الباقة</label>
                 <input name="name" class="form-control" required></div>
             <div class="col-md-2"><label class="form-label">سعر البيع</label>
                 <input name="retail_price" type="number" min="0" class="form-control" required></div>
-            <div class="col-md-2"><label class="form-label">سعر الجملة</label>
+            <div class="col-md-2"><label class="form-label">يخصم من المحفظة</label>
                 <input name="wholesale_price" type="number" min="0" class="form-control" required></div>
-            <div class="col-md-2 d-flex align-items-end"><button class="btn btn-success w-100">إضافة</button></div>
+            <div class="col-md-2"><label class="form-label">سعر من قبلي</label>
+                <input name="self_price" type="number" min="0" class="form-control" placeholder="= سعر البيع"></div>
+            <div class="col-12"><button class="btn btn-success px-4">إضافة</button></div>
         </form>
-        <small class="text-muted mt-2">الربح = سعر البيع − سعر الجملة (يُحسب تلقائياً).</small>
+        <small class="text-muted mt-2">الربح = سعر البيع − المخصوم من المحفظة (يُحسب تلقائياً). سعر من قبلي = السعر لما تسدد عن المشترك (بدون أرباح).</small>
     </div>
 
     <div class="card p-4">
         <div class="table-responsive">
             <table class="table">
-                <thead><tr><th>الفئة</th><th>الباقة</th><th>سعر البيع</th><th>سعر الجملة</th>
+                <thead><tr><th>الفئة</th><th>الباقة</th><th>سعر البيع</th><th>يخصم من المحفظة</th><th>سعر من قبلي</th>
                 <th>الربح</th><th>المشتركين</th><th></th></tr></thead>
                 <tbody>{plan_rows}</tbody>
             </table>
@@ -2814,7 +2869,7 @@ def fetch_activations(con, start, end_full):
                p.name AS plan_name,
                a.retail_price,
                a.payment_type,
-               a.settled_at,
+               substr(a.settled_at, 1, 19) AS settled_at,
                a.amount,
                CASE WHEN a.payment_type = 'نقد' THEN a.profit ELSE 0 END AS profit,
                a.notes,
@@ -2916,18 +2971,18 @@ def reports():
         <div class="col-6 col-md-4"><div class="card stat-card p-3"><h6>التفعيلات</h6><h3>{len(activations)}</h3>
             <small class="text-muted">خصم من المحفظة: {money(total_cost)}</small></div></div>
         <div class="col-6 col-md-4"><div class="card stat-card p-3"><h6>مجموع مبالغ الاشتراكات</h6><h3 class="text-primary">{money(totals['collected'])}</h3>
-            <small class="text-muted">المحصّل نقداً ({totals['cash_n']})</small></div></div>
+            <small class="text-muted">نقد {money(totals['cash'])} + من قبلي {money(totals['self'])}</small></div></div>
         <div class="col-6 col-md-4"><div class="card stat-card p-3"><h6>الأرباح</h6><h3 class="text-success">{money(totals['profit'])}</h3>
             <small class="text-muted">من المحصّل نقداً</small></div></div>
-        <div class="col-6 col-md-4"><div class="card stat-card p-3"><h6>الدفع من الجيب الخاص</h6><h3 class="text-info">{money(totals['pocket'])}</h3>
-            <small class="text-muted">{totals['pocket_n']} عملية بسعر الجملة</small></div></div>
+        <div class="col-6 col-md-4"><div class="card stat-card p-3"><h6>مسددين من قبلي</h6><h3 class="text-info">{money(totals['self'])}</h3>
+            <small class="text-muted">{totals['self_n']} عملية — بدون أرباح</small></div></div>
         <div class="col-12 col-md-4"><div class="card stat-card p-3"><h6>الديون الحالية</h6><h3 class="text-danger">{money(totals['debt'])}</h3>
             <small class="text-muted">على {totals['debt_n']} مشترك (كل الفترات)</small></div></div>
     </div>
-    <p class="text-muted small mb-4">المحصّل والأرباح والجيب الخاص تنحسب حسب تاريخ الاستلام/الترحيل، والتفعيلات حسب تاريخ التفعيل.</p>
+    <p class="text-muted small mb-4">المحصّل والأرباح ومسددين من قبلي تنحسب حسب تاريخ الاستلام/الترحيل، والتفعيلات حسب تاريخ التفعيل.</p>
 
     <div class="card p-4 mb-4">
-        <h5>حسب الباقة (المحصّل نقداً)</h5>
+        <h5>حسب الباقة (الأرباح من النقد)</h5>
         <div class="table-responsive">
             <table class="table table-striped">
                 <thead><tr><th>الباقة</th><th>التفعيلات</th><th>المحصّل</th><th>الجملة</th><th>الربح</th></tr></thead>
@@ -3051,6 +3106,30 @@ def settings():
             con.commit()
             flash("تم حفظ الإعدادات", "success")
 
+        elif action == "reset":
+            if form_text("confirm_word") != "تصفير":
+                flash("ما تصفّر شي — لازم تكتب كلمة (تصفير) بالضبط", "danger")
+            else:
+                # نسخة احتياطية تلقائية قبل التصفير
+                backup_dir = os.path.join(os.path.dirname(DB_NAME) or BASE_DIR, "backups")
+                os.makedirs(backup_dir, exist_ok=True)
+                bpath = os.path.join(backup_dir, f"before_reset_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.db")
+                dst = sqlite3.connect(bpath)
+                con.backup(dst)
+                dst.close()
+                for table in ("debts", "activations", "wallet_transactions", "subscribers"):
+                    con.execute(f"DELETE FROM {table}")
+                if request.form.get("reset_plans") == "1":
+                    con.execute("DELETE FROM plans")
+                    seed_plans(con)
+                con.execute("DELETE FROM settings WHERE key = 'collection_reset_at'")
+                con.execute("DELETE FROM sqlite_sequence WHERE name IN "
+                            "('debts', 'activations', 'wallet_transactions', 'subscribers', 'plans')")
+                con.commit()
+                flash("تم تصفير البرنامج: المشتركين والعمليات وحركات المحفظة صارت صفر"
+                      + (" والباقات رجعت للأسعار الجديدة" if request.form.get("reset_plans") == "1" else "")
+                      + f" — انحفظت نسخة احتياطية بالسيرفر: backups/{os.path.basename(bpath)}", "success")
+
         elif action == "add_user":
             username = form_text("username")
             password = request.form.get("password", "")
@@ -3078,7 +3157,7 @@ def settings():
 
     users = con.execute("SELECT id, username FROM users ORDER BY id").fetchall()
     shop = get_setting(con, "shop_name")
-    qp = get_setting(con, "quick_prices", "38000,40000")
+    qp = get_setting(con, "quick_prices", "")
     con.close()
 
     user_rows = "".join(f"""
@@ -3133,7 +3212,7 @@ def settings():
                     <div class="col-md-6"><label class="form-label">اسم المحل (توقيع رسائل واتساب)</label>
                         <input name="shop_name" value="{esc(shop)}" class="form-control" placeholder="مثال: مكتب الأمل للإنترنت - 0770xxxxxxx"></div>
                     <div class="col-md-4"><label class="form-label">أسعار بيع سريعة (أزرار بالتفعيل والترحيل)</label>
-                        <input name="quick_prices" value="{esc(qp)}" class="form-control" dir="ltr" placeholder="38000,40000"></div>
+                        <input name="quick_prices" value="{esc(qp)}" class="form-control" dir="ltr" placeholder="مثال: 42000,50000"></div>
                     <div class="col-md-2 d-flex align-items-end"><button class="btn btn-primary w-100">حفظ</button></div>
                 </form>
             </div>
@@ -3144,6 +3223,25 @@ def settings():
                 <h5><i class="bi bi-cloud-arrow-down text-primary"></i> النسخ الاحتياطي</h5>
                 <p class="text-muted mb-3">نزّل نسخة كاملة من قاعدة البيانات واحتفظ بيها بمكان آمن (يُنصح بعمل نسخة كل أسبوع).</p>
                 <div><a href="{url_for('backup')}" class="btn btn-dark"><i class="bi bi-download"></i> تحميل نسخة احتياطية</a></div>
+            </div>
+        </div>
+
+        <div class="col-12">
+            <div class="card p-4 border-danger" style="border-width:2px">
+                <h5 class="text-danger"><i class="bi bi-exclamation-octagon"></i> تصفير البرنامج</h5>
+                <p class="text-muted mb-3">يمسح <b>كل المشتركين والعمليات والديون وحركات المحفظة</b> حتى تبدي من جديد.
+                المستخدمين والإعدادات يبقون. قبل التصفير تنحفظ نسخة احتياطية تلقائياً بالسيرفر — ومع ذلك نزّل نسخة لنفسك أول.</p>
+                <form method="post" class="row g-2" data-confirm="آخر تأكيد: راح ينمسح كلشي. متأكد؟">
+                    <input type="hidden" name="action" value="reset">
+                    <div class="col-12">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" name="reset_plans" value="1" id="rp" checked>
+                            <label class="form-check-label" for="rp">ورجّع الباقات للأسعار الجديدة (Basic، Plus، Turbo، Pro Max، ايكو، بلص، استاندر، تيربو)</label>
+                        </div>
+                    </div>
+                    <div class="col-md-6"><input name="confirm_word" class="form-control" placeholder="اكتب كلمة: تصفير" autocomplete="off" required></div>
+                    <div class="col-md-6"><button class="btn btn-danger w-100"><i class="bi bi-trash3"></i> تصفير كل البيانات</button></div>
+                </form>
             </div>
         </div>
     </div>

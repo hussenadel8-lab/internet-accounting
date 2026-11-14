@@ -3,3 +3,4 @@ internet_accounting.db
 __pycache__/
 .venv/
 imports_tmp/
+backups/
