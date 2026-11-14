@@ -765,7 +765,7 @@ BASE_HTML = """
 {% set titles = {
     'dashboard': 'الرئيسية', 'subscribers': 'المشتركون', 'subscriber_detail': 'تفاصيل المشترك',
     'wallet': 'المحفظة', 'plans': 'الباقات والأسعار', 'reports': 'التقارير',
-    'settings': 'الإعدادات', 'debts': 'الديون ومسددين من قبلي', 'settle_operation': 'ترحيل', 'import_users': 'استيراد اليوزرات', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل'
+    'settings': 'الإعدادات', 'debts': 'الديون ومسددين من قبلي', 'settle_operation': 'ترحيل', 'import_users': 'استيراد اليوزرات', 'wa_import': 'تفعيلات واتساب', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل'
 } %}
 {% set ep = request.endpoint %}
 
@@ -775,7 +775,7 @@ BASE_HTML = """
         <div class="brand"><span class="logo"><i class="bi bi-router"></i></span> محاسبة الإنترنت</div>
         <nav class="nav-side">
             <a href="{{ url_for('dashboard') }}" class="{{ 'active' if ep == 'dashboard' }}"><i class="bi bi-grid-1x2"></i> الرئيسية</a>
-            <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer','import_users'] }}"><i class="bi bi-people"></i> المشتركون</a>
+            <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer','import_users','wa_import'] }}"><i class="bi bi-people"></i> المشتركون</a>
             <a href="{{ url_for('debts') }}" class="{{ 'active' if ep == 'debts' }}"><i class="bi bi-journal-text"></i> الديون</a>
             <a href="{{ url_for('wallet') }}" class="{{ 'active' if ep == 'wallet' }}"><i class="bi bi-wallet2"></i> المحفظة</a>
             <a href="{{ url_for('plans') }}" class="{{ 'active' if ep == 'plans' }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
@@ -826,6 +826,7 @@ BASE_HTML = """
 <div class="offcanvas offcanvas-bottom" tabindex="-1" id="more" style="height:auto;border-radius:22px 22px 0 0;background:var(--card)">
     <div class="offcanvas-body nav-side pb-4">
         <div class="who mb-2"><span class="avatar">{{ (session.get('username') or '?')[:1]|upper }}</span> {{ session.get('username') }}</div>
+        <a href="{{ url_for('wa_import') }}"><i class="bi bi-whatsapp"></i> تفعيلات من واتساب الشركة</a>
         <a href="{{ url_for('reports') }}"><i class="bi bi-bar-chart-line"></i> التقارير</a>
         <a href="{{ url_for('plans') }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
         <a href="{{ url_for('settings') }}"><i class="bi bi-gear"></i> الإعدادات والنسخ الاحتياطي</a>
@@ -1520,6 +1521,9 @@ def subscribers():
         </button>
         <a href="{url_for('import_users')}" class="btn btn-outline-primary w-100 mt-2 d-flex align-items-center justify-content-center gap-2">
             <i class="bi bi-file-earmark-arrow-up"></i> استيراد يوزرات من ملف الشركة (PDF)
+        </a>
+        <a href="{url_for('wa_import')}" class="btn btn-outline-success w-100 mt-2 d-flex align-items-center justify-content-center gap-2">
+            <i class="bi bi-whatsapp"></i> تسجيل تفعيلات من رسائل واتساب الشركة
         </a>
         <div class="collapse" id="addSub">
         <form method="post" class="row g-3 mt-2 pay-form">
@@ -2715,6 +2719,278 @@ def import_users():
             <li>اليوزر المكرر بالملف ينحسب مرة وحدة بآخر تاريخ.</li>
             <li>الاستيراد ما يخصم من المحفظة. تكدر تسجّل اشتراكاتهم <b>دين</b> حتى تنحسب بالديون.</li>
         </ul>
+    </div>
+    """
+    return page(body)
+
+
+# ---------------------------------------------------------------------------
+# تسجيل التفعيلات من رسائل واتساب الشركة
+# ---------------------------------------------------------------------------
+
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+_INVISIBLE = re.compile(r"[‎‏‪-‮⁦-⁩﻿ ]")
+# بداية رسالة بملف تصدير الدردشة: "14/11/2026, 10:23 - " أو "[14/11/2026, 10:23:45] " أو "[10:23, 14/11/2026] "
+_MSG_START = re.compile(
+    r"^\[?\s*(?:(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})[,،]?\s+(\d{1,2}:\d{2})"
+    r"|(\d{1,2}:\d{2})(?::\d{2})?\s*(?:[AaPp][Mm]|[صم])?[,،]\s*(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4}))")
+
+
+def _msg_date(d1, d2, y):
+    """تحويل التاريخ (يوم/شهر أو شهر/يوم) إلى YYYY-MM-DD."""
+    d1, d2, y = int(d1), int(d2), int(y)
+    if y < 100:
+        y += 2000
+    day, month = (d2, d1) if d2 > 12 >= d1 else (d1, d2)
+    try:
+        return date(y, month, day).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def split_whatsapp_messages(text):
+    """تقسيم نص الدردشة إلى رسائل، كل رسالة: (التاريخ، الوقت، النص)."""
+    text = _INVISIBLE.sub("", text.translate(_AR_DIGITS)).replace("\r\n", "\n")
+    messages, current = [], None
+    for line in text.split("\n"):
+        m = _MSG_START.match(line.strip())
+        if m:
+            if m.group(1):
+                day, tm = _msg_date(m.group(1), m.group(2), m.group(3)), m.group(4)
+            else:
+                day, tm = _msg_date(m.group(6), m.group(7), m.group(8)), m.group(5)
+            if day:
+                current = [day, tm, line]
+                messages.append(current)
+                continue
+        if current is not None:
+            current[2] += "\n" + line
+        elif line.strip():
+            # نص ملصوق بدون تواريخ: كل فقرة رسالة بتاريخ اليوم
+            current = [today_str(), "", line]
+            messages.append(current)
+    return messages
+
+
+def find_activations_in_chat(con, text):
+    """يدور على يوزرات المشتركين الموجودين داخل الرسائل."""
+    subs = {}
+    for s in con.execute("""
+        SELECT s.id, s.name, s.username, s.plan_id, s.expiry_date, p.name AS plan_name,
+               p.wholesale_price, p.retail_price
+        FROM subscribers s JOIN plans p ON p.id = s.plan_id
+    """):
+        subs.setdefault(s["username"].strip().lower(), dict(s))
+    found, seen, unmatched = [], set(), 0
+    messages = split_whatsapp_messages(text)
+    for day, tm, body in messages:
+        tokens = {t.lower().strip("._-") for t in re.findall(r"[A-Za-z0-9@._\-]{3,}", body)}
+        hits = [subs[t] for t in tokens if t in subs]
+        if not hits:
+            unmatched += 1
+            continue
+        for s in hits:
+            key = (s["id"], day)
+            if key in seen:
+                continue
+            seen.add(key)
+            already = con.execute("""
+                SELECT 1 FROM activations WHERE subscriber_id = ? AND substr(operation_date, 1, 10) = ?
+            """, (s["id"], day)).fetchone()
+            found.append({**s, "day": day, "time": tm, "already": bool(already),
+                          "snippet": " ".join(body.split())[:140]})
+    found.sort(key=lambda r: (r["day"], r["time"]))
+    return found, len(messages), unmatched
+
+
+def _read_chat_upload(file):
+    """قراءة ملف تصدير الدردشة (txt أو zip من الآيفون)."""
+    import zipfile
+    data = file.read()
+    if data[:2] == b"PK":
+        with zipfile.ZipFile(BytesIO(data)) as z:
+            names = [n for n in z.namelist() if n.lower().endswith(".txt")]
+            if not names:
+                return ""
+            data = z.read(names[0])
+    for enc in ("utf-8-sig", "utf-16", "cp1256"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "ignore")
+
+
+@app.route("/whatsapp-import", methods=["GET", "POST"])
+@login_required
+def wa_import():
+    import json
+
+    if request.method == "POST" and request.form.get("step") == "read":
+        text = request.form.get("text") or ""
+        file = request.files.get("file")
+        if file and file.filename:
+            text += "\n" + _read_chat_upload(file)
+        if not text.strip():
+            flash("الصق الرسائل أو ارفع ملف تصدير الدردشة", "danger")
+            return redirect(url_for("wa_import"))
+        con = db()
+        found, total, unmatched = find_activations_in_chat(con, text)
+        con.close()
+        if not found:
+            flash(f"قريت {total} رسالة بس ما لگيت بيها أي يوزر من مشتركينك. "
+                  f"تأكد إن اليوزرات مضافة بالبرنامج.", "warning")
+            return redirect(url_for("wa_import"))
+        os.makedirs(IMPORT_DIR, exist_ok=True)
+        _cleanup_imports()
+        token = secrets.token_hex(16)
+        with open(_import_path(token), "w", encoding="utf-8") as f:
+            json.dump({"rows": found, "total": total, "unmatched": unmatched}, f, ensure_ascii=False)
+        return redirect(url_for("wa_import", t=token))
+
+    if request.method == "POST" and request.form.get("step") == "confirm":
+        path = _import_path(request.form.get("token"))
+        if not path or not os.path.exists(path):
+            flash("انتهت صلاحية العملية، اقرأ الرسائل مرة ثانية", "danger")
+            return redirect(url_for("wa_import"))
+        with open(path, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+
+        con = db()
+        con.execute("BEGIN IMMEDIATE")
+        done = skipped = no_balance = 0
+        cost = 0
+        for i, r in enumerate(rows):
+            if request.form.get(f"use_{i}") != "1":
+                continue
+            s = con.execute("SELECT * FROM subscribers WHERE id = ?", (r["id"],)).fetchone()
+            plan = con.execute("SELECT * FROM plans WHERE id = ?", (s["plan_id"],)).fetchone() if s else None
+            if not s or not plan:
+                skipped += 1
+                continue
+            # نفس اليوم مسجل من قبل؟
+            if con.execute("SELECT 1 FROM activations WHERE subscriber_id = ? AND substr(operation_date, 1, 10) = ?",
+                           (s["id"], r["day"])).fetchone():
+                skipped += 1
+                continue
+            amount = plan["wholesale_price"]
+            if wallet_balance(con) < amount:
+                no_balance += 1
+                continue
+            when = f"{r['day']} {(r['time'] or '00:00')[:5]}:00"
+            start = r["day"]
+            current_exp = parse_date(s["expiry_date"])
+            if current_exp and current_exp > start:
+                start = current_exp
+            new_expiry = expiry_from(start)
+            con.execute("""
+                INSERT INTO wallet_transactions (transaction_type, amount, notes, created_at)
+                VALUES ('خصم', ?, ?, ?)
+            """, (amount, f"تفعيل (واتساب الشركة) - {s['username']} - {plan['name']}", when))
+            con.execute("""
+                INSERT INTO activations
+                (subscriber_id, plan_id, operation_type, amount, retail_price, profit,
+                 payment_type, paid_amount, settled_at, notes, operation_date)
+                VALUES (?, ?, 'تفعيل', ?, ?, ?, 'دين', 0, NULL, 'من رسائل واتساب الشركة', ?)
+            """, (s["id"], plan["id"], amount, plan["retail_price"], plan["retail_price"] - amount, when))
+            con.execute("UPDATE subscribers SET activation_date = ?, expiry_date = ? WHERE id = ?",
+                        (r["day"], new_expiry, s["id"]))
+            done += 1
+            cost += amount
+        con.commit()
+        con.close()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        msg = f"تم تسجيل {done} تفعيل كـ دين — أُضيف شهر لكل واحد وخُصم {money(cost)} د.ع من المحفظة"
+        if skipped:
+            msg += f" — تخطي {skipped} (مسجل من قبل بنفس اليوم)"
+        flash(msg, "success" if done else "warning")
+        if no_balance:
+            flash(f"{no_balance} تفعيل ما تسجل لأن رصيد المحفظة ما يكفي — اشحن وأعد المحاولة", "danger")
+        return redirect(url_for("debts"))
+
+    # --- المعاينة ---
+    token = request.args.get("t")
+    path = _import_path(token) if token else None
+    if path and os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        rows = payload["rows"]
+        con = db()
+        balance = wallet_balance(con)
+        con.close()
+        new_rows = [r for r in rows if not r["already"]]
+        need = sum(r["wholesale_price"] for r in new_rows)
+        table = "".join(f"""
+            <tr class="{'opacity-50' if r['already'] else ''}">
+                <td><input type="checkbox" name="use_{i}" value="1" class="form-check-input row-check" {'' if r['already'] else 'checked'}></td>
+                <td>{esc(r['day'])} <small class="text-muted">{esc(r['time'])}</small></td>
+                <td dir="ltr"><b>{esc(r['username'])}</b></td>
+                <td>{esc(r['name'])}</td>
+                <td>{esc(r['plan_name'])}</td>
+                <td>{money(r['wholesale_price'])}</td>
+                <td>{'<span class="badge bg-secondary">مسجل من قبل</span>' if r['already'] else '<span class="badge bg-success">جديد</span>'}</td>
+                <td><small class="text-muted">{esc(r['snippet'])}</small></td>
+            </tr>""" for i, r in enumerate(rows))
+        body = f"""
+        <h2 class="mb-4">تفعيلات من واتساب الشركة</h2>
+        <form method="post">
+            <input type="hidden" name="step" value="confirm">
+            <input type="hidden" name="token" value="{esc(token)}">
+            <div class="row g-3 mb-4">
+                <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>رسائل مقروءة</h6><h3>{payload['total']}</h3>
+                    <small class="text-muted">{payload['unmatched']} بدون يوزر معروف</small></div></div>
+                <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>تفعيلات جديدة</h6><h3 class="text-success">{len(new_rows)}</h3>
+                    <small class="text-muted">{len(rows) - len(new_rows)} مسجلة من قبل</small></div></div>
+                <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>راح ينخصم</h6><h3 class="text-danger">{money(need)}</h3></div></div>
+                <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>رصيد المحفظة</h6>
+                    <h3 class="{'text-danger' if balance < need else 'text-success'}">{money(balance)}</h3></div></div>
+            </div>
+            <div class="alert alert-info">كل تفعيل محدد: <b>يضيف شهر</b> للمشترك، <b>يخصم سعر الجملة</b> من المحفظة،
+            ويتسجل <b>دين</b>. لما تستلم المبلغ رحّله نقداً.</div>
+            <div class="card p-4 mb-4">
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="allChk"
+                           onchange="document.querySelectorAll('.row-check').forEach(c => c.checked = this.checked)">
+                    <label class="form-check-label" for="allChk">تحديد الكل</label>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead><tr><th></th><th>التاريخ</th><th>اليوزر</th><th>الاسم</th><th>الباقة</th><th>الجملة</th><th>الحالة</th><th>الرسالة</th></tr></thead>
+                        <tbody>{table}</tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="d-flex gap-2 import-actions">
+                <button class="btn btn-success flex-fill py-3"><i class="bi bi-check2-all"></i> تسجيل التفعيلات المحددة</button>
+                <a href="{url_for('wa_import')}" class="btn btn-outline-secondary py-3">إلغاء</a>
+            </div>
+        </form>
+        """
+        return page(body)
+
+    body = f"""
+    <h2 class="mb-4">تفعيلات من واتساب الشركة</h2>
+    <div class="card p-4" style="max-width:720px">
+        <h5><i class="bi bi-whatsapp" style="color:#25D366"></i> الصق رسائل التفعيل أو ارفع ملف الدردشة</h5>
+        <p class="text-muted">البرنامج يدور بالرسائل على <b>يوزرات مشتركينك</b>. كل يوزر يلگاه:
+        يضيف شهر، يخصم سعر الجملة من المحفظة، ويسجله <b>دين</b>. قبل الحفظ تشوف معاينة.</p>
+        <form method="post" enctype="multipart/form-data">
+            <input type="hidden" name="step" value="read">
+            <label class="form-label">الصق الرسائل هنا</label>
+            <textarea name="text" class="form-control mb-3" rows="7" dir="auto"
+                      placeholder="انسخ رسائل التفعيل من محادثة الشركة والصقها هنا..."></textarea>
+            <label class="form-label">أو ارفع ملف تصدير الدردشة (txt أو zip)</label>
+            <input type="file" name="file" accept=".txt,.zip,text/plain,application/zip" class="form-control mb-3">
+            <button class="btn btn-primary w-100 py-3"><i class="bi bi-search"></i> قراءة الرسائل</button>
+        </form>
+        <div class="text-muted small mt-3">
+            <b>تصدير الدردشة من واتساب:</b> افتح محادثة الشركة ← ⋮ (أو اسم المحادثة بالآيفون) ←
+            المزيد ← <b>تصدير الدردشة</b> ← <b>بدون وسائط</b> ← احفظ الملف وارفعه هنا.
+            <br>التفعيل المسجل بنفس اليوم لنفس المشترك ما يتكرر، فتكدر ترفع نفس الدردشة كل يوم بدون خوف.
+        </div>
     </div>
     """
     return page(body)
