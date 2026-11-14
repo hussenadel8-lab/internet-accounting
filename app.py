@@ -185,6 +185,27 @@ def init_db():
             cur.execute("UPDATE subscribers SET expiry_date = ? WHERE id = ?",
                         (expiry, row["id"]))
 
+    # الديون: كل دين أو تسديد سطر مستقل، والرصيد = مجموع الديون - مجموع التسديدات
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS debts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subscriber_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            notes TEXT,
+            activation_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_debts_sub ON debts(subscriber_id)")
+
+    if not column_exists(cur, "activations", "payment_type"):
+        cur.execute("ALTER TABLE activations ADD COLUMN payment_type TEXT NOT NULL DEFAULT 'نقد'")
+        cur.execute("ALTER TABLE activations ADD COLUMN paid_amount INTEGER")
+        cur.execute("UPDATE activations SET paid_amount = retail_price")
+
+    cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_act_date ON activations(operation_date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_date ON wallet_transactions(created_at)")
 
@@ -223,6 +244,94 @@ def status_badge(expiry_date):
     if days_left <= EXPIRY_WARNING_DAYS:
         return f'<span class="badge bg-warning text-dark">باقي {days_left} يوم</span>'
     return f'<span class="badge bg-success">فعّال ({days_left} يوم)</span>'
+
+
+# رصيد دين المشترك (يُستخدم داخل استعلامات فيها s = جدول المشتركين)
+DEBT_SUBQUERY = """
+    SELECT COALESCE(SUM(CASE WHEN d.kind = 'دين' THEN d.amount ELSE -d.amount END), 0)
+    FROM debts d WHERE d.subscriber_id = s.id
+"""
+
+
+def get_setting(con, key, default=""):
+    row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row and row["value"] is not None else default
+
+
+def set_setting(con, key, value):
+    con.execute("INSERT INTO settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+
+def payment_badge(kind):
+    if kind == "دين":
+        return '<span class="badge bg-danger-subtle text-danger-emphasis">دين</span>'
+    return '<span class="badge bg-success-subtle text-success-emphasis">نقد</span>'
+
+
+# ---------------------------------------------------------------------------
+# واتساب
+# ---------------------------------------------------------------------------
+
+def wa_phone(phone):
+    """تحويل رقم الهاتف لصيغة واتساب الدولية (العراق 964 افتراضياً)."""
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0") and len(digits) == 11:
+        digits = "964" + digits[1:]
+    elif digits.startswith("7") and len(digits) == 10:
+        digits = "964" + digits
+    return digits if len(digits) >= 10 else ""
+
+
+def wa_link(phone, text):
+    from urllib.parse import quote
+    num = wa_phone(phone)
+    return f"https://wa.me/{num}?text={quote(text)}" if num else ""
+
+
+def wa_button(phone, text, label="واتساب", size="btn-sm"):
+    link = wa_link(phone, text)
+    content = f'<i class="bi bi-whatsapp"></i>{" " + label if label else ""}'
+    if not link:
+        return f'<button type="button" class="btn {size} btn-wa" disabled title="لا يوجد رقم هاتف">{content}</button>'
+    return f'<a href="{esc(link)}" target="_blank" rel="noopener" class="btn {size} btn-wa" title="مراسلة على واتساب">{content}</a>'
+
+
+def _sign(shop):
+    return f"\n\n{shop}" if shop else ""
+
+
+def msg_reminder(s, shop=""):
+    exp = parse_date(s["expiry_date"]) or ""
+    if exp and exp < today_str():
+        line = f"نود إعلامك بأن اشتراكك ({s['plan_name']}) انتهى بتاريخ {exp}."
+    else:
+        line = f"نود تذكيرك بأن اشتراكك ({s['plan_name']}) ينتهي بتاريخ {exp}."
+    return (f"مرحباً {s['name']} 🌹\n{line}\n"
+            f"اليوزر: {s['username']}\nللتجديد يرجى التواصل معنا." + _sign(shop))
+
+
+def msg_debt(s, debt, shop=""):
+    if not debt or debt <= 0:
+        return f"مرحباً {s['name']} 🌹\nلا يوجد عليك أي مبلغ متبقي، شكراً لك." + _sign(shop)
+    return (f"مرحباً {s['name']} 🌹\nنود تذكيرك بوجود مبلغ متبقي بذمتك قدره {money(debt)} د.ع "
+            f"عن اشتراك الإنترنت (اليوزر: {s['username']}).\nيرجى التسديد بأقرب وقت، وشكراً لك." + _sign(shop))
+
+
+def msg_activated(s, shop=""):
+    return (f"مرحباً {s['name']} 🌹\nتم تفعيل اشتراكك ({s['plan_name']}) بنجاح ✅\n"
+            f"اليوزر: {s['username']}\nينتهي بتاريخ: {s['expiry_date']}" + _sign(shop))
+
+
+def msg_confirm(s, op, debt, shop=""):
+    text = (f"مرحباً {s['name']} 🌹\nتم {op['operation_type']} اشتراكك ({op['plan_name']}) بنجاح ✅\n"
+            f"اليوزر: {s['username']}\nينتهي بتاريخ: {s['expiry_date']}\n"
+            f"المبلغ: {money(op['retail_price'])} د.ع")
+    if op["payment_type"] == "دين":
+        text += f"\nالمدفوع: {money(op['paid_amount'])} د.ع\nالمتبقي بذمتك: {money(debt)} د.ع"
+    return text + _sign(shop)
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +565,21 @@ BASE_HTML = """
         .btn-sm { border-radius: 10px; padding: 6px 12px; font-size: .85rem; }
         .btn-primary { background: var(--primary); border-color: var(--primary); }
         .btn-primary:hover { background: #4338ca; border-color: #4338ca; }
+        .btn-wa { background: #25D366; border-color: #25D366; color: #fff; }
+        .btn-wa:hover, .btn-wa:focus { background: #1ebe5b; border-color: #1ebe5b; color: #fff; }
+        .btn-wa:disabled { background: #a7d7b8; border-color: #a7d7b8; color: #fff; }
+        .pay-options { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .pay-opt {
+            display: flex; flex-direction: column; align-items: center; gap: 2px; cursor: pointer;
+            padding: 16px 10px; border-radius: 16px; border: 2px solid var(--line); background: var(--soft);
+            text-align: center; transition: .15s;
+        }
+        .pay-opt i { font-size: 1.7rem; color: #10b981; }
+        .pay-opt.debt i { color: #ef4444; }
+        .pay-opt b { font-size: 1.05rem; }
+        .pay-opt small { color: var(--muted); }
+        .btn-check:checked + .pay-opt { border-color: #10b981; background: rgba(16,185,129,.08); }
+        .btn-check:checked + .pay-opt.debt { border-color: #ef4444; background: rgba(239,68,68,.08); }
         .badge { font-weight: 600; padding: .45em .8em; border-radius: 999px; }
         .alert { border-radius: 14px; border: 0; }
 
@@ -537,7 +661,7 @@ BASE_HTML = """
 {% set titles = {
     'dashboard': 'الرئيسية', 'subscribers': 'المشتركون', 'subscriber_detail': 'تفاصيل المشترك',
     'wallet': 'المحفظة', 'plans': 'الباقات والأسعار', 'reports': 'التقارير',
-    'settings': 'الإعدادات', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل اشتراك'
+    'settings': 'الإعدادات', 'debts': 'حساب الديون', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل اشتراك'
 } %}
 {% set ep = request.endpoint %}
 
@@ -548,6 +672,7 @@ BASE_HTML = """
         <nav class="nav-side">
             <a href="{{ url_for('dashboard') }}" class="{{ 'active' if ep == 'dashboard' }}"><i class="bi bi-grid-1x2"></i> الرئيسية</a>
             <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer'] }}"><i class="bi bi-people"></i> المشتركون</a>
+            <a href="{{ url_for('debts') }}" class="{{ 'active' if ep == 'debts' }}"><i class="bi bi-journal-text"></i> الديون</a>
             <a href="{{ url_for('wallet') }}" class="{{ 'active' if ep == 'wallet' }}"><i class="bi bi-wallet2"></i> المحفظة</a>
             <a href="{{ url_for('plans') }}" class="{{ 'active' if ep == 'plans' }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
             <a href="{{ url_for('reports') }}" class="{{ 'active' if ep == 'reports' }}"><i class="bi bi-bar-chart-line"></i> التقارير</a>
@@ -590,13 +715,14 @@ BASE_HTML = """
     <a href="{{ url_for('dashboard') }}" class="{{ 'active' if ep == 'dashboard' }}"><i class="bi bi-grid-1x2{{ '-fill' if ep == 'dashboard' }}"></i>الرئيسية</a>
     <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer'] }}"><i class="bi bi-people{{ '-fill' if ep in ['subscribers','subscriber_detail','activate','transfer'] }}"></i>المشتركون</a>
     <a href="{{ url_for('wallet') }}" class="{{ 'active' if ep == 'wallet' }}"><i class="bi bi-wallet{{ '-fill' if ep == 'wallet' else '2' }}"></i>المحفظة</a>
-    <a href="{{ url_for('reports') }}" class="{{ 'active' if ep == 'reports' }}"><i class="bi bi-bar-chart-line{{ '-fill' if ep == 'reports' }}"></i>التقارير</a>
-    <button data-bs-toggle="offcanvas" data-bs-target="#more" class="{{ 'active' if ep in ['plans','settings'] }}"><i class="bi bi-three-dots"></i>المزيد</button>
+    <a href="{{ url_for('debts') }}" class="{{ 'active' if ep == 'debts' }}"><i class="bi bi-journal-text"></i>الديون</a>
+    <button data-bs-toggle="offcanvas" data-bs-target="#more" class="{{ 'active' if ep in ['plans','settings','reports'] }}"><i class="bi bi-three-dots"></i>المزيد</button>
 </nav>
 
 <div class="offcanvas offcanvas-bottom" tabindex="-1" id="more" style="height:auto;border-radius:22px 22px 0 0;background:var(--card)">
     <div class="offcanvas-body nav-side pb-4">
         <div class="who mb-2"><span class="avatar">{{ (session.get('username') or '?')[:1]|upper }}</span> {{ session.get('username') }}</div>
+        <a href="{{ url_for('reports') }}"><i class="bi bi-bar-chart-line"></i> التقارير</a>
         <a href="{{ url_for('plans') }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
         <a href="{{ url_for('settings') }}"><i class="bi bi-gear"></i> الإعدادات والنسخ الاحتياطي</a>
         <a href="#" onclick="toggleTheme();return false;"><i class="bi bi-moon-stars"></i> الوضع الليلي</a>
@@ -771,6 +897,10 @@ def dashboard():
     """).fetchall()
 
     balance = wallet_balance(con)
+    total_debt = con.execute(
+        "SELECT COALESCE(SUM(CASE WHEN kind = 'دين' THEN amount ELSE -amount END), 0) AS t FROM debts"
+    ).fetchone()["t"]
+    shop = get_setting(con, "shop_name")
     con.close()
 
     expiring_rows = "".join(f"""
@@ -781,7 +911,10 @@ def dashboard():
             <td>{esc(s['plan_name'])}</td>
             <td>{esc(s['expiry_date'])}</td>
             <td>{status_badge(s['expiry_date'])}</td>
-            <td><a href="{url_for('transfer', subscriber_id=s['id'])}" class="btn btn-sm btn-warning">ترحيل</a></td>
+            <td><div class="d-flex gap-1">
+                <a href="{url_for('transfer', subscriber_id=s['id'])}" class="btn btn-sm btn-warning">ترحيل</a>
+                {wa_button(s['phone'], msg_reminder(s, shop), 'تذكير')}
+            </div></td>
         </tr>""" for s in expiring) or '<tr><td colspan="7" class="text-muted text-center">لا توجد اشتراكات منتهية أو قريبة الانتهاء 👍</td></tr>'
 
     recent_rows = "".join(f"""
@@ -820,12 +953,14 @@ def dashboard():
             </div>
         </div>
         <div class="col-6 col-md-3">
+            <a href="{url_for('debts')}" class="text-decoration-none">
             <div class="card stat-card p-4">
-                <span class="stat-icon" style="background:rgba(245,158,11,.14);color:#f59e0b"><i class="bi bi-trophy"></i></span>
-                <h6>إجمالي الأرباح</h6>
-                <h2>{money(stats['total_profit'])} د.ع</h2>
-                <small class="text-muted">تفعيل: {stats['activations'] or 0} — ترحيل: {stats['transfers'] or 0}</small>
+                <span class="stat-icon" style="background:rgba(239,68,68,.14);color:#ef4444"><i class="bi bi-journal-text"></i></span>
+                <h6>ديون على المشتركين</h6>
+                <h2 class="text-danger">{money(total_debt)} د.ع</h2>
+                <small class="text-muted">إجمالي الأرباح: {money(stats['total_profit'])} د.ع</small>
             </div>
+            </a>
         </div>
     </div>
 
@@ -953,7 +1088,7 @@ def plan_options(plans, selected_id=None):
     for plan in plans:
         sel = "selected" if selected_id is not None and plan["id"] == selected_id else ""
         html += f"""
-        <option value="{plan['id']}" {sel}>
+        <option value="{plan['id']}" data-retail="{plan['retail_price']}" {sel}>
             {esc(plan['category'])} - {esc(plan['name'])}
             | البيع {money(plan['retail_price'])}
             | الجملة {money(plan['wholesale_price'])}
@@ -985,6 +1120,52 @@ def read_subscriber_form(con):
     if not data["expiry_date"]:
         data["expiry_date"] = expiry_from(data["activation_date"])
     return data, None
+
+
+def subscriber_form_fields(plans_list, s=None, with_expiry=False):
+    """حقول نموذج المشترك (للإضافة والتعديل)."""
+    v = (lambda k: esc(s[k]) if s else "")
+    expiry = f"""
+            <div class="col-6 col-md-2">
+                <label class="form-label">تاريخ الانتهاء</label>
+                <input type="date" name="expiry_date" value="{v('expiry_date')}" class="form-control">
+            </div>""" if with_expiry else ""
+    return f"""
+            <div class="col-md-4">
+                <label class="form-label">اسم المشترك</label>
+                <input name="name" value="{v('name')}" class="form-control" required>
+            </div>
+            <div class="col-md-4">
+                <label class="form-label">يوزر المشترك</label>
+                <input name="username" value="{v('username')}" class="form-control" required>
+            </div>
+            <div class="col-md-4">
+                <label class="form-label">رقم الهاتف (واتساب)</label>
+                <input name="phone" value="{v('phone')}" type="tel" inputmode="tel" class="form-control" placeholder="07XXXXXXXXX">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label">نوع الاشتراك</label>
+                <select name="plan_id" class="form-select" required>
+                    {'' if s else '<option value="">اختر الاشتراك</option>'}
+                    {plan_options(plans_list, s['plan_id'] if s else None)}
+                </select>
+            </div>
+            <div class="{'col-6 col-md-2' if with_expiry else 'col-md-4'}">
+                <label class="form-label">تاريخ التفعيل</label>
+                <input type="date" name="activation_date" value="{v('activation_date') if s else today_str()}" class="form-control" required>
+            </div>{expiry}
+            <div class="col-md-4">
+                <label class="form-label">ملاحظات</label>
+                <input name="notes" value="{v('notes')}" class="form-control">
+            </div>"""
+
+
+def delete_form(subscriber_id, label=True, cls="btn-sm"):
+    return f"""
+        <form method="post" action="{url_for('delete_subscriber', subscriber_id=subscriber_id)}" class="d-inline"
+              data-confirm="سيتم حذف المشترك وكل عملياته وديونه نهائياً. متأكد؟">
+            <button class="btn {cls} btn-outline-danger"><i class="bi bi-trash3"></i>{' حذف' if label else ''}</button>
+        </form>"""
 
 
 @app.route("/subscribers", methods=["GET", "POST"])
@@ -1030,36 +1211,46 @@ def subscribers():
     elif status == "active":
         where.append("s.expiry_date >= ?")
         params.append(today)
+    elif status == "debt":
+        where.append(f"({DEBT_SUBQUERY}) > 0")
     if plan_filter.isdigit():
         where.append("s.plan_id = ?")
         params.append(int(plan_filter))
 
     plans_list = con.execute("SELECT * FROM plans ORDER BY category, id").fetchall()
     subscriber_rows = con.execute(f"""
-        SELECT s.*, p.name AS plan_name, p.retail_price, p.wholesale_price, p.profit
+        SELECT s.*, p.name AS plan_name, p.retail_price, p.wholesale_price, p.profit,
+               ({DEBT_SUBQUERY}) AS debt
         FROM subscribers s
         JOIN plans p ON p.id = s.plan_id
         {"WHERE " + " AND ".join(where) if where else ""}
         ORDER BY s.id DESC
     """, params).fetchall()
+    shop = get_setting(con, "shop_name")
     con.close()
 
     subscriber_html = ""
     for s in subscriber_rows:
+        debt = s["debt"] or 0
+        debt_html = f'<span class="text-danger fw-bold">{money(debt)}</span>' if debt > 0 else '<span class="text-muted">—</span>'
+        wa_text = msg_debt(s, debt, shop) if debt > 0 else msg_reminder(s, shop)
         subscriber_html += f"""
         <tr>
-            <td>{esc(s['name'])}</td>
+            <td><a href="{url_for('subscriber_detail', subscriber_id=s['id'])}" class="fw-bold text-decoration-none">{esc(s['name'])}</a></td>
             <td>{esc(s['username'])}</td>
-            <td>{esc(s['phone'])}</td>
+            <td dir="ltr">{esc(s['phone'])}</td>
             <td>{esc(s['plan_name'])}</td>
             <td>{money(s['retail_price'])}</td>
-            <td>{money(s['wholesale_price'])}</td>
-            <td>{esc(s['activation_date'])}</td>
             <td>{status_badge(s['expiry_date'])}</td>
-            <td class="text-nowrap">
-                <a href="{url_for('activate', subscriber_id=s['id'])}" class="btn btn-sm btn-success">تفعيل</a>
-                <a href="{url_for('transfer', subscriber_id=s['id'])}" class="btn btn-sm btn-warning">ترحيل</a>
-                <a href="{url_for('subscriber_detail', subscriber_id=s['id'])}" class="btn btn-sm btn-outline-primary">تفاصيل</a>
+            <td>{debt_html}</td>
+            <td>
+                <div class="d-flex flex-wrap gap-1">
+                    <a href="{url_for('activate', subscriber_id=s['id'])}" class="btn btn-sm btn-success">تفعيل</a>
+                    <a href="{url_for('transfer', subscriber_id=s['id'])}" class="btn btn-sm btn-warning">ترحيل</a>
+                    {wa_button(s['phone'], wa_text, '')}
+                    <a href="{url_for('subscriber_detail', subscriber_id=s['id'])}#edit" class="btn btn-sm btn-outline-primary" title="تعديل"><i class="bi bi-pencil"></i></a>
+                    {delete_form(s['id'], label=False)}
+                </div>
             </td>
         </tr>"""
 
@@ -1077,34 +1268,7 @@ def subscribers():
         </button>
         <div class="collapse" id="addSub">
         <form method="post" class="row g-3 mt-2">
-            <div class="col-md-4">
-                <label class="form-label">اسم المشترك</label>
-                <input name="name" class="form-control" required>
-            </div>
-            <div class="col-md-4">
-                <label class="form-label">يوزر المشترك</label>
-                <input name="username" class="form-control" required>
-            </div>
-            <div class="col-md-4">
-                <label class="form-label">رقم الهاتف</label>
-                <input name="phone" class="form-control">
-            </div>
-            <div class="col-md-4">
-                <label class="form-label">نوع الاشتراك</label>
-                <select name="plan_id" class="form-select" required>
-                    <option value="">اختر الاشتراك</option>
-                    {plan_options(plans_list)}
-                </select>
-            </div>
-            <div class="col-md-4">
-                <label class="form-label">تاريخ التفعيل</label>
-                <input type="date" name="activation_date" value="{today}" class="form-control" required>
-                <small class="text-muted">ينتهي تلقائياً بعد {SUBSCRIPTION_DAYS} يوم</small>
-            </div>
-            <div class="col-md-4">
-                <label class="form-label">ملاحظات</label>
-                <input name="notes" class="form-control">
-            </div>
+            {subscriber_form_fields(plans_list)}
             <div class="col-12">
                 <button class="btn btn-primary">حفظ المشترك</button>
                 <small class="text-muted ms-2">الإضافة لا تخصم من المحفظة — استخدم زر "تفعيل" للخصم.</small>
@@ -1118,10 +1282,11 @@ def subscribers():
             <h5 class="mb-0">قائمة المشتركين ({len(subscriber_rows)})</h5>
             <form method="get" class="d-flex flex-wrap gap-2 filter-bar">
                 <input name="q" value="{esc(q)}" class="form-control" placeholder="بحث بالاسم/اليوزر/الهاتف" style="max-width:240px">
-                <select name="status" class="form-select" style="max-width:150px">
+                <select name="status" class="form-select" style="max-width:160px">
                     <option value="">كل الحالات</option>
                     <option value="active" {"selected" if status == "active" else ""}>فعّال</option>
                     <option value="expired" {"selected" if status == "expired" else ""}>منتهي</option>
+                    <option value="debt" {"selected" if status == "debt" else ""}>عليه دين</option>
                 </select>
                 <select name="plan" class="form-select" style="max-width:180px">
                     <option value="">كل الباقات</option>{plan_filter_opts}
@@ -1136,10 +1301,10 @@ def subscribers():
                 <thead>
                     <tr>
                         <th>الاسم</th><th>اليوزر</th><th>الهاتف</th><th>الاشتراك</th>
-                        <th>سعر البيع</th><th>سعر الجملة</th><th>آخر تفعيل</th><th>الحالة</th><th>الإجراء</th>
+                        <th>سعر البيع</th><th>الحالة</th><th>الدين</th><th></th>
                     </tr>
                 </thead>
-                <tbody>{subscriber_html or '<tr><td colspan="9" class="text-muted text-center">لا يوجد مشتركون</td></tr>'}</tbody>
+                <tbody>{subscriber_html or '<tr><td colspan="8" class="text-muted text-center">لا يوجد مشتركون</td></tr>'}</tbody>
             </table>
         </div>
     </div>
@@ -1148,9 +1313,10 @@ def subscribers():
 
 
 def get_subscriber(con, subscriber_id):
-    return con.execute("""
+    return con.execute(f"""
         SELECT s.*, p.name AS plan_name, p.category,
-               p.retail_price, p.wholesale_price, p.profit
+               p.retail_price, p.wholesale_price, p.profit,
+               ({DEBT_SUBQUERY}) AS debt
         FROM subscribers s
         JOIN plans p ON p.id = s.plan_id
         WHERE s.id = ?
@@ -1191,8 +1357,34 @@ def subscriber_detail(subscriber_id):
         JOIN plans p ON p.id = a.plan_id
         WHERE a.subscriber_id = ? ORDER BY a.id DESC
     """, (subscriber_id,)).fetchall()
+    ledger = con.execute("""
+        SELECT * FROM debts WHERE subscriber_id = ? ORDER BY id DESC
+    """, (subscriber_id,)).fetchall()
+    shop = get_setting(con, "shop_name")
+
+    # رسالة تأكيد بعد عملية تفعيل/ترحيل مباشرة
+    done_html = ""
+    done_id = request.args.get("done", "")
+    if done_id.isdigit():
+        op = con.execute("""
+            SELECT a.*, p.name AS plan_name FROM activations a JOIN plans p ON p.id = a.plan_id
+            WHERE a.id = ? AND a.subscriber_id = ?
+        """, (int(done_id), subscriber_id)).fetchone()
+        if op:
+            done_html = f"""
+            <div class="card p-4 mb-4 border-success" style="border-width:2px">
+                <div class="d-flex flex-wrap align-items-center justify-content-between gap-3">
+                    <div>
+                        <h5 class="mb-1 text-success"><i class="bi bi-check-circle-fill"></i> تمت عملية {esc(op['operation_type'])} بنجاح</h5>
+                        <div class="text-muted">الدفع: <b>{esc(op['payment_type'])}</b>
+                        {f" — دين جديد: <b class='text-danger'>{money((op['retail_price'] or 0) - (op['paid_amount'] or 0))} د.ع</b>" if op['payment_type'] == 'دين' else ''}</div>
+                    </div>
+                    {wa_button(s['phone'], msg_confirm(s, op, s['debt'] or 0, shop), 'أرسل تأكيد للمشترك', 'btn-lg')}
+                </div>
+            </div>"""
     con.close()
 
+    debt = s["debt"] or 0
     total_paid = sum(h["retail_price"] or 0 for h in history)
     total_profit = sum(h["profit"] or 0 for h in history)
 
@@ -1201,20 +1393,36 @@ def subscriber_detail(subscriber_id):
             <td>{esc(h['operation_type'])}</td>
             <td>{esc(h['plan_name'])}</td>
             <td>{money(h['retail_price'])}</td>
+            <td>{payment_badge(h['payment_type'])}</td>
             <td>{money(h['amount'])}</td>
             <td>{money(h['profit'])}</td>
             <td>{esc(h['notes'])}</td>
             <td>{esc(h['operation_date'])}</td>
-        </tr>""" for h in history) or '<tr><td colspan="7" class="text-muted text-center">لا توجد عمليات لهذا المشترك</td></tr>'
+        </tr>""" for h in history) or '<tr><td colspan="8" class="text-muted text-center">لا توجد عمليات لهذا المشترك</td></tr>'
 
-    if history:
-        delete_html = '<p class="text-muted small mb-0">لا يمكن حذف مشترك لديه عمليات مسجلة حتى لا تختل الحسابات والتقارير.</p>'
-    else:
-        delete_html = f"""
-        <form method="post" action="{url_for('delete_subscriber', subscriber_id=subscriber_id)}"
-              data-confirm="متأكد تريد تحذف هذا المشترك؟">
-            <button class="btn btn-outline-danger"><i class="bi bi-trash3"></i> حذف المشترك</button>
-        </form>"""
+    ledger_rows = "".join(f"""
+        <tr>
+            <td>{'<span class="badge bg-danger">دين</span>' if d['kind'] == 'دين' else '<span class="badge bg-success">تسديد</span>'}</td>
+            <td class="{'text-danger' if d['kind'] == 'دين' else 'text-success'} fw-bold">{'+' if d['kind'] == 'دين' else '-'}{money(d['amount'])}</td>
+            <td>{esc(d['notes'])}</td>
+            <td>{esc(d['created_at'])}</td>
+        </tr>""" for d in ledger) or '<tr><td colspan="4" class="text-muted text-center">لا توجد حركات ديون</td></tr>'
+
+    pay_form = f"""
+        <form method="post" action="{url_for('pay_debt', subscriber_id=subscriber_id)}" class="row g-2 mb-3">
+            <div class="col-6 col-md-3">
+                <label class="form-label">مبلغ التسديد</label>
+                <input type="number" name="amount" min="1" max="{debt}" value="{debt}" class="form-control" required>
+            </div>
+            <div class="col-6 col-md-5">
+                <label class="form-label">ملاحظات</label>
+                <input name="notes" class="form-control" placeholder="مثال: قبض نقداً">
+            </div>
+            <div class="col-12 col-md-4 d-flex align-items-end gap-2">
+                <button class="btn btn-success flex-fill"><i class="bi bi-cash-coin"></i> تسجيل تسديد</button>
+                {wa_button(s['phone'], msg_debt(s, debt, shop), 'مطالبة')}
+            </div>
+        </form>""" if debt > 0 else '<p class="text-success mb-3"><i class="bi bi-check2-circle"></i> لا يوجد دين على هذا المشترك.</p>'
 
     body = f"""
     <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4 page-head">
@@ -1222,66 +1430,77 @@ def subscriber_detail(subscriber_id):
         <div>
             <a href="{url_for('activate', subscriber_id=subscriber_id)}" class="btn btn-success">تفعيل</a>
             <a href="{url_for('transfer', subscriber_id=subscriber_id)}" class="btn btn-warning">ترحيل</a>
-            <a href="{url_for('subscribers')}" class="btn btn-secondary">رجوع</a>
+            <a href="{url_for('subscribers')}" class="btn btn-outline-secondary">رجوع</a>
         </div>
     </div>
 
+    {done_html}
+
     <div class="row g-3 mb-4">
-        <div class="col-12 col-md-4"><div class="card stat-card p-3"><h6>الحالة</h6><div>{status_badge(s['expiry_date'])}</div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>الحالة</h6><div>{status_badge(s['expiry_date'])}</div>
             <small class="text-muted">ينتهي: {esc(s['expiry_date'])}</small></div></div>
-        <div class="col-6 col-md-4"><div class="card stat-card p-3"><h6>مجموع المبيعات له</h6><h4 class="fw-bold">{money(total_paid)} د.ع</h4></div></div>
-        <div class="col-6 col-md-4"><div class="card stat-card p-3"><h6>مجموع الأرباح منه</h6><h4 class="text-success fw-bold">{money(total_profit)} د.ع</h4></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>الدين الحالي</h6>
+            <h4 class="fw-bold {'text-danger' if debt > 0 else 'text-success'}">{money(debt)} د.ع</h4></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>مجموع المبيعات له</h6><h4 class="fw-bold">{money(total_paid)} د.ع</h4></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>مجموع الأرباح منه</h6><h4 class="text-success fw-bold">{money(total_profit)} د.ع</h4></div></div>
     </div>
 
     <div class="card p-4 mb-4">
-        <h5>تعديل البيانات</h5>
+        <h5><i class="bi bi-whatsapp" style="color:#25D366"></i> مراسلة المشترك على واتساب</h5>
+        {"<p class='text-muted mb-0'>أضف رقم هاتف للمشترك حتى تكدر تراسله.</p>" if not wa_phone(s['phone']) else f'''
+        <div class="d-flex flex-wrap gap-2 mb-3">
+            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setMsg(this)" data-msg="{esc(msg_reminder(s, shop))}">تذكير بانتهاء الاشتراك</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setMsg(this)" data-msg="{esc(msg_debt(s, debt, shop))}">مطالبة بالدين</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setMsg(this)" data-msg="{esc(msg_activated(s, shop))}">تأكيد التفعيل</button>
+        </div>
+        <textarea id="waText" class="form-control mb-3" rows="4" placeholder="اكتب رسالتك هنا...">{esc(msg_reminder(s, shop))}</textarea>
+        <div><button type="button" class="btn btn-wa" onclick="sendWa()"><i class="bi bi-whatsapp"></i> إرسال على واتساب</button></div>
+        <script>
+            function setMsg(b) {{ document.getElementById('waText').value = b.dataset.msg; }}
+            function sendWa() {{
+                const t = document.getElementById('waText').value.trim();
+                if (!t) return;
+                window.open('https://wa.me/{wa_phone(s['phone'])}?text=' + encodeURIComponent(t), '_blank');
+            }}
+        </script>'''}
+    </div>
+
+    <div class="card p-4 mb-4" id="debts">
+        <h5><i class="bi bi-journal-text text-danger"></i> حساب الديون — الرصيد: <span class="{'text-danger' if debt > 0 else 'text-success'}">{money(debt)} د.ع</span></h5>
+        {pay_form}
+        <div class="table-responsive">
+            <table class="table">
+                <thead><tr><th>النوع</th><th>المبلغ</th><th>الملاحظات</th><th>التاريخ</th></tr></thead>
+                <tbody>{ledger_rows}</tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card p-4 mb-4" id="edit">
+        <h5><i class="bi bi-pencil-square text-primary"></i> تعديل البيانات</h5>
         <form method="post" class="row g-3 mt-1">
-            <div class="col-md-4">
-                <label class="form-label">اسم المشترك</label>
-                <input name="name" value="{esc(s['name'])}" class="form-control" required>
-            </div>
-            <div class="col-md-4">
-                <label class="form-label">اليوزر</label>
-                <input name="username" value="{esc(s['username'])}" class="form-control" required>
-            </div>
-            <div class="col-md-4">
-                <label class="form-label">رقم الهاتف</label>
-                <input name="phone" value="{esc(s['phone'])}" class="form-control">
-            </div>
-            <div class="col-md-4">
-                <label class="form-label">نوع الاشتراك</label>
-                <select name="plan_id" class="form-select" required>{plan_options(plans_list, s['plan_id'])}</select>
-            </div>
-            <div class="col-md-2">
-                <label class="form-label">تاريخ التفعيل</label>
-                <input type="date" name="activation_date" value="{esc(s['activation_date'])}" class="form-control" required>
-            </div>
-            <div class="col-md-2">
-                <label class="form-label">تاريخ الانتهاء</label>
-                <input type="date" name="expiry_date" value="{esc(s['expiry_date'])}" class="form-control">
-            </div>
-            <div class="col-md-4">
-                <label class="form-label">ملاحظات</label>
-                <input name="notes" value="{esc(s['notes'])}" class="form-control">
-            </div>
-            <div class="col-12">
-                <button class="btn btn-primary">حفظ التعديلات</button>
+            {subscriber_form_fields(plans_list, s, with_expiry=True)}
+            <div class="col-12 d-flex flex-wrap gap-2 justify-content-between">
+                <button class="btn btn-primary"><i class="bi bi-check2"></i> حفظ التعديلات</button>
             </div>
         </form>
+        <hr>
+        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
+            <small class="text-muted">حذف المشترك يحذف كل عملياته وديونه من التقارير نهائياً (حركات المحفظة تبقى).</small>
+            {delete_form(subscriber_id, cls='')}
+        </div>
     </div>
 
-    <div class="card p-4 mb-4">
-        <h5>سجل العمليات</h5>
+    <div class="card p-4">
+        <h5><i class="bi bi-clock-history text-primary"></i> سجل العمليات</h5>
         <div class="table-responsive">
             <table class="table table-striped">
-                <thead><tr><th>العملية</th><th>الاشتراك</th><th>سعر البيع</th><th>سعر الجملة</th>
+                <thead><tr><th>العملية</th><th>الاشتراك</th><th>سعر البيع</th><th>الدفع</th><th>سعر الجملة</th>
                 <th>الربح</th><th>الملاحظات</th><th>التاريخ</th></tr></thead>
                 <tbody>{history_rows}</tbody>
             </table>
         </div>
     </div>
-
-    <div class="card p-4 border border-danger-subtle">{delete_html}</div>
     """
     return page(body)
 
@@ -1290,16 +1509,154 @@ def subscriber_detail(subscriber_id):
 @login_required
 def delete_subscriber(subscriber_id):
     con = db()
-    has_ops = con.execute("SELECT 1 FROM activations WHERE subscriber_id = ?", (subscriber_id,)).fetchone()
-    if has_ops:
+    s = con.execute("SELECT username FROM subscribers WHERE id = ?", (subscriber_id,)).fetchone()
+    if not s:
         con.close()
-        flash("لا يمكن حذف مشترك لديه عمليات مسجلة", "danger")
-        return redirect(url_for("subscriber_detail", subscriber_id=subscriber_id))
+        flash("المشترك غير موجود", "danger")
+        return redirect(url_for("subscribers"))
+    con.execute("DELETE FROM debts WHERE subscriber_id = ?", (subscriber_id,))
+    con.execute("DELETE FROM activations WHERE subscriber_id = ?", (subscriber_id,))
     con.execute("DELETE FROM subscribers WHERE id = ?", (subscriber_id,))
     con.commit()
     con.close()
-    flash("تم حذف المشترك", "success")
+    flash(f"تم حذف المشترك {s['username']}", "success")
     return redirect(url_for("subscribers"))
+
+
+# ---------------------------------------------------------------------------
+# الديون
+# ---------------------------------------------------------------------------
+
+@app.route("/subscribers/<int:subscriber_id>/pay", methods=["POST"])
+@login_required
+def pay_debt(subscriber_id):
+    back = request.form.get("back") or url_for("subscriber_detail", subscriber_id=subscriber_id) + "#debts"
+    if not back.startswith("/"):
+        back = url_for("debts")
+    amount = parse_amount(request.form.get("amount"))
+    con = db()
+    s = get_subscriber(con, subscriber_id)
+    if not s:
+        con.close()
+        flash("المشترك غير موجود", "danger")
+        return redirect(url_for("debts"))
+    debt = s["debt"] or 0
+    if not amount or amount <= 0:
+        flash("أدخل مبلغاً صحيحاً", "danger")
+    elif amount > debt:
+        flash(f"المبلغ أكبر من الدين ({money(debt)} د.ع)", "danger")
+    else:
+        notes = form_text("notes") or "تسديد"
+        con.execute("""
+            INSERT INTO debts (subscriber_id, kind, amount, notes, created_at)
+            VALUES (?, 'تسديد', ?, ?, ?)
+        """, (subscriber_id, amount, notes, now_str()))
+        con.commit()
+        left = debt - amount
+        flash(f"تم تسجيل تسديد {money(amount)} د.ع من {s['name']} — المتبقي: {money(left)} د.ع", "success")
+    con.close()
+    return redirect(back)
+
+
+@app.route("/debts")
+@login_required
+def debts():
+    con = db()
+    rows = con.execute(f"""
+        SELECT s.*, p.name AS plan_name, ({DEBT_SUBQUERY}) AS debt,
+               (SELECT MAX(created_at) FROM debts d WHERE d.subscriber_id = s.id AND d.kind = 'دين') AS last_debt
+        FROM subscribers s JOIN plans p ON p.id = s.plan_id
+        WHERE ({DEBT_SUBQUERY}) > 0
+        ORDER BY debt DESC
+    """).fetchall()
+    month_start = date.today().replace(day=1).strftime("%Y-%m-%d")
+    collected = con.execute("""
+        SELECT COALESCE(SUM(amount), 0) AS c FROM debts WHERE kind = 'تسديد' AND created_at >= ?
+    """, (month_start,)).fetchone()["c"]
+    recent = con.execute("""
+        SELECT d.*, s.name, s.username FROM debts d JOIN subscribers s ON s.id = d.subscriber_id
+        ORDER BY d.id DESC LIMIT 30
+    """).fetchall()
+    shop = get_setting(con, "shop_name")
+    con.close()
+
+    total = sum(r["debt"] for r in rows)
+    back = url_for("debts")
+
+    debt_rows = "".join(f"""
+        <tr>
+            <td><a href="{url_for('subscriber_detail', subscriber_id=r['id'])}#debts" class="fw-bold text-decoration-none">{esc(r['name'])}</a></td>
+            <td>{esc(r['username'])}</td>
+            <td dir="ltr">{esc(r['phone'])}</td>
+            <td class="text-danger fw-bold">{money(r['debt'])} د.ع</td>
+            <td>{esc((r['last_debt'] or '')[:10])}</td>
+            <td>
+                <form method="post" action="{url_for('pay_debt', subscriber_id=r['id'])}" class="d-flex gap-1 flex-wrap">
+                    <input type="hidden" name="back" value="{back}">
+                    <input type="number" name="amount" min="1" max="{r['debt']}" value="{r['debt']}" class="form-control form-control-sm" style="max-width:120px" required>
+                    <button class="btn btn-sm btn-success"><i class="bi bi-cash-coin"></i> تسديد</button>
+                    {wa_button(r['phone'], msg_debt(r, r['debt'], shop), '')}
+                </form>
+            </td>
+        </tr>""" for r in rows)
+
+    recent_rows = "".join(f"""
+        <tr>
+            <td>{'<span class="badge bg-danger">دين</span>' if d['kind'] == 'دين' else '<span class="badge bg-success">تسديد</span>'}</td>
+            <td>{esc(d['name'])}</td>
+            <td class="{'text-danger' if d['kind'] == 'دين' else 'text-success'} fw-bold">{money(d['amount'])}</td>
+            <td>{esc(d['notes'])}</td>
+            <td>{esc(d['created_at'])}</td>
+        </tr>""" for d in recent)
+
+    body = f"""
+    <h2 class="mb-4">حساب الديون</h2>
+
+    <div class="row g-3 mb-4">
+        <div class="col-6 col-md-4">
+            <div class="card stat-card p-4" style="background:linear-gradient(135deg,#dc2626,#f43f5e);color:#fff;border:0">
+                <span class="stat-icon" style="background:rgba(255,255,255,.18);color:#fff"><i class="bi bi-journal-text"></i></span>
+                <h6 style="color:rgba(255,255,255,.85)">مجموع الديون</h6>
+                <h2>{money(total)} د.ع</h2>
+            </div>
+        </div>
+        <div class="col-6 col-md-4">
+            <div class="card stat-card p-4">
+                <span class="stat-icon"><i class="bi bi-people"></i></span>
+                <h6>عدد المدينين</h6>
+                <h2>{len(rows)}</h2>
+            </div>
+        </div>
+        <div class="col-12 col-md-4">
+            <div class="card stat-card p-4">
+                <span class="stat-icon" style="background:rgba(16,185,129,.14);color:#10b981"><i class="bi bi-cash-stack"></i></span>
+                <h6>المقبوض من الديون هذا الشهر</h6>
+                <h2 class="text-success">{money(collected)} د.ع</h2>
+            </div>
+        </div>
+    </div>
+
+    <div class="card p-4 mb-4">
+        <h5>المشتركين الي عليهم دين</h5>
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الهاتف</th><th>الدين</th><th>آخر دين</th><th>تسديد / مطالبة</th></tr></thead>
+                <tbody>{debt_rows or '<tr><td colspan="6" class="text-muted text-center">ماكو ديون 👍</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card p-4">
+        <h5>آخر حركات الديون</h5>
+        <div class="table-responsive">
+            <table class="table table-striped">
+                <thead><tr><th>النوع</th><th>المشترك</th><th>المبلغ</th><th>الملاحظات</th><th>التاريخ</th></tr></thead>
+                <tbody>{recent_rows or '<tr><td colspan="5" class="text-muted text-center">لا توجد حركات</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+    """
+    return page(body)
 
 
 # ---------------------------------------------------------------------------
@@ -1332,12 +1689,28 @@ def perform_operation(subscriber_id, operation_type):
 
     amount = plan["wholesale_price"]
     balance = wallet_balance(con)
+    back = url_for("transfer" if operation_type == "ترحيل" else "activate", subscriber_id=subscriber_id)
 
     if balance < amount:
         con.rollback()
         con.close()
         flash(f"الرصيد غير كافٍ. المطلوب {money(amount)} د.ع، والرصيد الحالي {money(balance)} د.ع", "danger")
-        return redirect(url_for("subscribers"))
+        return redirect(back)
+
+    # طريقة الدفع: نقد (مقبوض) أو دين (يتحول لحساب الديون)
+    payment_type = request.form.get("payment_type", "نقد")
+    if payment_type not in ("نقد", "دين"):
+        payment_type = "نقد"
+    retail = plan["retail_price"]
+    if payment_type == "نقد":
+        paid = retail
+    else:
+        paid = parse_amount(request.form.get("paid_amount")) or 0
+        if paid < 0 or paid >= retail:
+            con.rollback()
+            con.close()
+            flash("المبلغ المدفوع لازم يكون أقل من سعر البيع (إذا دفع كامل اختار نقد)", "danger")
+            return redirect(back)
 
     notes = form_text("notes")
     now = now_str()
@@ -1356,12 +1729,22 @@ def perform_operation(subscriber_id, operation_type):
     """, ("خصم", amount, f"{operation_type} - {subscriber['username']} - {plan['name']}"
                          + (f" - {notes}" if notes else ""), now))
 
-    con.execute("""
+    cur = con.execute("""
         INSERT INTO activations
-        (subscriber_id, plan_id, operation_type, amount, retail_price, profit, notes, operation_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (subscriber_id, plan_id, operation_type, amount,
-          plan["retail_price"], plan["profit"], notes, now))
+        (subscriber_id, plan_id, operation_type, amount, retail_price, profit,
+         payment_type, paid_amount, notes, operation_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (subscriber_id, plan_id, operation_type, amount, retail, plan["profit"],
+          payment_type, paid, notes, now))
+    activation_id = cur.lastrowid
+
+    if payment_type == "دين":
+        con.execute("""
+            INSERT INTO debts (subscriber_id, kind, amount, notes, activation_id, created_at)
+            VALUES (?, 'دين', ?, ?, ?, ?)
+        """, (subscriber_id, retail - paid,
+              f"{operation_type} {plan['name']}" + (f" (دفع {money(paid)})" if paid else ""),
+              activation_id, now))
 
     con.execute("""
         UPDATE subscribers
@@ -1373,9 +1756,12 @@ def perform_operation(subscriber_id, operation_type):
     con.commit()
     con.close()
 
-    flash(f"تمت عملية {operation_type} للمشترك {subscriber['username']} وخصم {money(amount)} د.ع "
-          f"من المحفظة — ينتهي الاشتراك بتاريخ {new_expiry}", "success")
-    return redirect(url_for("subscribers"))
+    msg = (f"تمت عملية {operation_type} للمشترك {subscriber['username']} وخصم {money(amount)} د.ع "
+           f"من المحفظة — ينتهي الاشتراك بتاريخ {new_expiry}")
+    if payment_type == "دين":
+        msg += f" — أُضيف {money(retail - paid)} د.ع لحساب الديون"
+    flash(msg, "success")
+    return redirect(url_for("subscriber_detail", subscriber_id=subscriber_id, done=activation_id))
 
 
 def operation_page(subscriber_id, operation_type):
@@ -1390,29 +1776,83 @@ def operation_page(subscriber_id, operation_type):
         return redirect(url_for("subscribers"))
 
     low = balance < subscriber["wholesale_price"]
+    debt = subscriber["debt"] or 0
 
     body = f"""
-    <div class="card p-4">
-        <h3>{operation_type} الاشتراك</h3>
-        <hr>
-        <p><b>اسم المشترك:</b> {esc(subscriber['name'])}</p>
-        <p><b>اليوزر:</b> {esc(subscriber['username'])}</p>
-        <p><b>الحالة الحالية:</b> {status_badge(subscriber['expiry_date'])} (ينتهي {esc(subscriber['expiry_date'])})</p>
-        <p><b>الرصيد الحالي:</b> <span class="{'text-danger' if low else 'text-success'}">{money(balance)} د.ع</span></p>
+    <h2 class="mb-4">{operation_type} الاشتراك</h2>
+    <div class="row g-4">
+        <div class="col-lg-4 order-lg-2">
+            <div class="card p-4">
+                <h5><i class="bi bi-person-circle text-primary"></i> {esc(subscriber['name'])}</h5>
+                <div class="d-flex justify-content-between py-1"><span class="text-muted">اليوزر</span><b>{esc(subscriber['username'])}</b></div>
+                <div class="d-flex justify-content-between py-1"><span class="text-muted">الحالة</span>{status_badge(subscriber['expiry_date'])}</div>
+                <div class="d-flex justify-content-between py-1"><span class="text-muted">ينتهي</span><span>{esc(subscriber['expiry_date'])}</span></div>
+                <div class="d-flex justify-content-between py-1"><span class="text-muted">دين سابق</span>
+                    <b class="{'text-danger' if debt > 0 else 'text-success'}">{money(debt)} د.ع</b></div>
+                <div class="d-flex justify-content-between py-1"><span class="text-muted">رصيد المحفظة</span>
+                    <b class="{'text-danger' if low else 'text-success'}">{money(balance)} د.ع</b></div>
+            </div>
+        </div>
 
-        <form method="post">
-            <label class="form-label">الباقة</label>
-            <select name="plan_id" class="form-select mb-2">{plan_options(plans_list, subscriber['plan_id'])}</select>
-            <small class="text-muted d-block mb-3">المبلغ المخصوم من المحفظة = سعر الجملة للباقة المختارة.
-            {"عند الترحيل تُضاف المدة على تاريخ الانتهاء الحالي إذا كان الاشتراك بعده فعّال." if operation_type == "ترحيل" else ""}</small>
+        <div class="col-lg-8 order-lg-1">
+            <div class="card p-4">
+                <form method="post">
+                    <label class="form-label">الباقة</label>
+                    <select name="plan_id" id="planSel" class="form-select mb-2" onchange="updPay()">{plan_options(plans_list, subscriber['plan_id'])}</select>
+                    <small class="text-muted d-block mb-4">المبلغ المخصوم من المحفظة = سعر الجملة للباقة المختارة.
+                    {"عند الترحيل تُضاف المدة على تاريخ الانتهاء الحالي إذا كان الاشتراك بعده فعّال." if operation_type == "ترحيل" else ""}</small>
 
-            <label class="form-label">ملاحظات {operation_type}</label>
-            <textarea name="notes" class="form-control mb-3" placeholder="اكتب الملاحظات هنا"></textarea>
+                    <label class="form-label">طريقة الدفع</label>
+                    <div class="pay-options mb-3">
+                        <input type="radio" class="btn-check" name="payment_type" id="payCash" value="نقد" checked onchange="updPay()">
+                        <label class="pay-opt" for="payCash">
+                            <i class="bi bi-cash-coin"></i>
+                            <b>نقداً</b><small>قبضت المبلغ كامل</small>
+                        </label>
+                        <input type="radio" class="btn-check" name="payment_type" id="payDebt" value="دين" onchange="updPay()">
+                        <label class="pay-opt debt" for="payDebt">
+                            <i class="bi bi-journal-text"></i>
+                            <b>دين</b><small>يتحول لحساب الديون</small>
+                        </label>
+                    </div>
 
-            <button class="btn btn-success">تأكيد {operation_type}</button>
-            <a href="{url_for('subscribers')}" class="btn btn-secondary">رجوع</a>
-        </form>
+                    <div id="debtBox" class="mb-3" style="display:none">
+                        <label class="form-label">المبلغ المقبوض الآن (اتركه 0 إذا ما دفع شي)</label>
+                        <input type="number" name="paid_amount" id="paidAmt" min="0" value="0" class="form-control" oninput="updPay()">
+                    </div>
+
+                    <div class="alert mb-3" id="paySummary" style="background:var(--soft)"></div>
+
+                    <label class="form-label">ملاحظات {operation_type}</label>
+                    <textarea name="notes" class="form-control mb-3" rows="2" placeholder="اكتب الملاحظات هنا"></textarea>
+
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-success flex-fill py-3"><i class="bi bi-check2-circle"></i> تأكيد {operation_type}</button>
+                        <a href="{url_for('subscribers')}" class="btn btn-outline-secondary py-3">رجوع</a>
+                    </div>
+                </form>
+            </div>
+        </div>
     </div>
+    <script>
+        function fmt(n) {{ return Number(n).toLocaleString('en-US'); }}
+        function updPay() {{
+            const retail = +document.getElementById('planSel').selectedOptions[0].dataset.retail;
+            const isDebt = document.getElementById('payDebt').checked;
+            document.getElementById('debtBox').style.display = isDebt ? '' : 'none';
+            const paid = isDebt ? Math.max(0, +document.getElementById('paidAmt').value || 0) : retail;
+            const s = document.getElementById('paySummary');
+            if (!isDebt) {{
+                s.innerHTML = 'سعر البيع: <b>' + fmt(retail) + ' د.ع</b> — مقبوض نقداً بالكامل ✅';
+            }} else if (paid >= retail) {{
+                s.innerHTML = '<span class="text-danger">المبلغ المقبوض يساوي أو أكثر من السعر — اختار نقداً</span>';
+            }} else {{
+                s.innerHTML = 'سعر البيع: <b>' + fmt(retail) + '</b> — المقبوض: <b>' + fmt(paid) +
+                    '</b> — يُضاف للديون: <b class="text-danger">' + fmt(retail - paid) + ' د.ع</b>';
+            }}
+        }}
+        updPay();
+    </script>
     """
     return page(body)
 
@@ -1582,6 +2022,8 @@ def fetch_activations(con, start, end_full):
                p.category,
                p.name AS plan_name,
                a.retail_price,
+               a.payment_type,
+               a.paid_amount,
                a.amount,
                a.profit,
                a.notes,
@@ -1632,6 +2074,7 @@ def reports():
             <td>{esc(a['subscriber_username'])}</td>
             <td>{esc(a['plan_name'])}</td>
             <td>{money(a['retail_price'])}</td>
+            <td>{payment_badge(a['payment_type'])}</td>
             <td>{money(a['amount'])}</td>
             <td>{money(a['profit'])}</td>
             <td>{esc(a['notes'])}</td>
@@ -1699,9 +2142,9 @@ def reports():
         <h5>تقرير التفعيل والترحيل</h5>
         <div class="table-responsive">
             <table class="table table-striped">
-                <thead><tr><th>العملية</th><th>المشترك</th><th>اليوزر</th><th>الاشتراك</th><th>سعر البيع</th>
+                <thead><tr><th>العملية</th><th>المشترك</th><th>اليوزر</th><th>الاشتراك</th><th>سعر البيع</th><th>الدفع</th>
                 <th>سعر الجملة</th><th>الربح</th><th>الملاحظات</th><th>التاريخ</th></tr></thead>
-                <tbody>{activation_rows or '<tr><td colspan="9" class="text-muted text-center">لا توجد عمليات بهذه الفترة</td></tr>'}</tbody>
+                <tbody>{activation_rows or '<tr><td colspan="10" class="text-muted text-center">لا توجد عمليات بهذه الفترة</td></tr>'}</tbody>
             </table>
         </div>
     </div>
@@ -1754,9 +2197,10 @@ def export_activations():
     rows = fetch_activations(con, start, end_full)
     con.close()
     headers = ["نوع العملية", "اسم المشترك", "اليوزر", "رقم الهاتف", "الفئة", "نوع الاشتراك",
-               "سعر البيع", "سعر الجملة (المخصوم)", "الربح", "الملاحظات", "التاريخ"]
+               "سعر البيع", "طريقة الدفع", "المقبوض", "سعر الجملة (المخصوم)", "الربح", "الملاحظات", "التاريخ"]
     totals = ["المجموع", "", "", "", "", "",
-              sum(r["retail_price"] or 0 for r in rows),
+              sum(r["retail_price"] or 0 for r in rows), "",
+              sum(r["paid_amount"] or 0 for r in rows),
               sum(r["amount"] or 0 for r in rows),
               sum(r["profit"] or 0 for r in rows), "", ""]
     return excel_response("تقرير اليوزرات", headers, rows,
@@ -1802,6 +2246,11 @@ def settings():
                 con.commit()
                 flash("تم تغيير كلمة المرور", "success")
 
+        elif action == "shop":
+            set_setting(con, "shop_name", form_text("shop_name"))
+            con.commit()
+            flash("تم حفظ اسم المحل", "success")
+
         elif action == "add_user":
             username = form_text("username")
             password = request.form.get("password", "")
@@ -1828,6 +2277,7 @@ def settings():
         return redirect(url_for("settings"))
 
     users = con.execute("SELECT id, username FROM users ORDER BY id").fetchall()
+    shop = get_setting(con, "shop_name")
     con.close()
 
     user_rows = "".join(f"""
@@ -1870,6 +2320,17 @@ def settings():
                     <div class="col-5"><input name="username" class="form-control" placeholder="اسم المستخدم" required></div>
                     <div class="col-4"><input name="password" type="password" minlength="6" class="form-control" placeholder="كلمة المرور" required></div>
                     <div class="col-3"><button class="btn btn-success w-100">إضافة</button></div>
+                </form>
+            </div>
+        </div>
+
+        <div class="col-12">
+            <div class="card p-4">
+                <h5><i class="bi bi-whatsapp" style="color:#25D366"></i> اسم المحل (توقيع رسائل واتساب)</h5>
+                <form method="post" class="row g-2">
+                    <input type="hidden" name="action" value="shop">
+                    <div class="col-md-8"><input name="shop_name" value="{esc(shop)}" class="form-control" placeholder="مثال: مكتب الأمل للإنترنت - 0770xxxxxxx"></div>
+                    <div class="col-md-4"><button class="btn btn-primary w-100">حفظ</button></div>
                 </form>
             </div>
         </div>
