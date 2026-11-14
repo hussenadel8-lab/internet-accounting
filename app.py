@@ -282,76 +282,296 @@ BASE_HTML = """
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="csrf-token" content="{{ csrf_token() }}">
-    <title>برنامج محاسبة الإنترنت</title>
+    <meta name="theme-color" content="#4f46e5">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>محاسبة الإنترنت</title>
+    <script>
+        // تطبيق الوضع الليلي قبل عرض الصفحة
+        (function () {
+            let t = null;
+            try { t = localStorage.getItem('theme'); } catch (e) {}
+            if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            document.documentElement.setAttribute('data-bs-theme', t);
+        })();
+    </script>
 
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.rtl.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
 
     <style>
-        body { background: #f1f5f9; font-family: Tahoma, Arial, sans-serif; }
+        :root, [data-bs-theme="light"] {
+            --bg: #f4f6fb;
+            --card: #ffffff;
+            --soft: #f1f3f9;
+            --text: #0f172a;
+            --muted: #64748b;
+            --line: #e5e7ef;
+            --primary: #4f46e5;
+            --primary-2: #7c3aed;
+            --primary-soft: #eef2ff;
+            --shadow: 0 1px 2px rgba(15,23,42,.04), 0 8px 24px rgba(15,23,42,.06);
+            --bs-body-bg: var(--bg);
+            --bs-body-color: var(--text);
+            --bs-primary: #4f46e5;
+            --bs-primary-rgb: 79,70,229;
+        }
+        [data-bs-theme="dark"] {
+            --bg: #0b1120;
+            --card: #131c2e;
+            --soft: #1a2438;
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --line: #243049;
+            --primary: #818cf8;
+            --primary-2: #a78bfa;
+            --primary-soft: rgba(129,140,248,.14);
+            --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+            --bs-body-bg: var(--bg);
+            --bs-body-color: var(--text);
+            --bs-border-color: var(--line);
+        }
 
+        * { -webkit-tap-highlight-color: transparent; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Tajawal', Tahoma, sans-serif;
+            font-size: 15.5px;
+        }
+        h2 { font-weight: 800; font-size: 1.6rem; }
+        h3, h4, h5 { font-weight: 700; }
+        h5 { font-size: 1.08rem; margin-bottom: 1rem; }
+        .text-muted { color: var(--muted) !important; }
+        a { color: var(--primary); }
+
+        /* ---------- الهيكل ---------- */
+        .layout { display: flex; min-height: 100vh; }
         .sidebar {
-            min-height: 100vh;
-            background: linear-gradient(180deg, #172554, #1e3a8a);
-            color: white;
-            padding: 20px 12px;
+            width: 260px; flex-shrink: 0;
+            background: var(--card);
+            border-left: 1px solid var(--line);
+            padding: 22px 16px;
+            position: sticky; top: 0; height: 100vh; overflow-y: auto;
         }
-        .sidebar h4 {
-            padding: 15px 8px;
-            border-bottom: 1px solid rgba(255,255,255,.2);
-            margin-bottom: 20px;
+        .brand {
+            display: flex; align-items: center; gap: 10px;
+            font-weight: 800; font-size: 1.2rem; color: var(--text);
+            padding: 4px 8px 22px;
         }
-        .sidebar a {
-            display: block; color: white; text-decoration: none;
-            padding: 12px; border-radius: 10px; margin-bottom: 7px;
+        .brand .logo {
+            width: 40px; height: 40px; border-radius: 12px;
+            display: grid; place-items: center; color: #fff; font-size: 1.2rem;
+            background: linear-gradient(135deg, var(--primary), var(--primary-2));
         }
-        .sidebar a:hover, .sidebar a.active { background: rgba(255,255,255,.18); }
-        .sidebar .who { font-size: 13px; opacity: .75; padding: 0 12px 10px; }
+        .nav-side a {
+            display: flex; align-items: center; gap: 12px;
+            color: var(--muted); text-decoration: none; font-weight: 500;
+            padding: 11px 14px; border-radius: 12px; margin-bottom: 4px;
+            transition: .15s;
+        }
+        .nav-side a i { font-size: 1.15rem; }
+        .nav-side a:hover { background: var(--soft); color: var(--text); }
+        .nav-side a.active { background: var(--primary-soft); color: var(--primary); font-weight: 700; }
+        .side-foot { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 14px; }
+        .who { display: flex; align-items: center; gap: 10px; padding: 6px 8px 10px; color: var(--muted); font-size: .92rem; }
+        .avatar {
+            width: 34px; height: 34px; border-radius: 50%;
+            background: var(--primary-soft); color: var(--primary);
+            display: grid; place-items: center; font-weight: 800;
+        }
 
-        .content { padding: 25px; }
-        .card { border: none; border-radius: 16px; box-shadow: 0 5px 18px rgba(15,23,42,.08); }
-        .balance-card { background: linear-gradient(135deg, #0f766e, #14b8a6); color: white; }
-        .stat-card { min-height: 125px; }
-        .table { vertical-align: middle; }
-        .btn { border-radius: 9px; }
-        .form-control, .form-select { border-radius: 9px; padding: 10px; }
-        .brand { font-weight: bold; font-size: 20px; }
+        .main { flex: 1; min-width: 0; padding: 28px 32px 40px; }
+        .main.full { padding: 0; }
 
-        @media (max-width: 767px) {
-            .sidebar { min-height: auto; }
-            .sidebar a { display: inline-block; padding: 8px 10px; }
-            .content { padding: 15px 10px; }
+        .topbar {
+            display: none;
+            position: sticky; top: 0; z-index: 1020;
+            background: color-mix(in srgb, var(--card) 88%, transparent);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--line);
+            padding: 12px 16px; padding-top: calc(12px + env(safe-area-inset-top));
+            align-items: center; justify-content: space-between;
         }
+        .topbar .title { font-weight: 800; font-size: 1.1rem; }
+        .icon-btn {
+            width: 40px; height: 40px; border-radius: 12px; border: 1px solid var(--line);
+            background: var(--card); color: var(--text);
+            display: inline-grid; place-items: center; font-size: 1.1rem;
+        }
+
+        .bottom-nav {
+            display: none;
+            position: fixed; bottom: 0; left: 0; right: 0; z-index: 1030;
+            background: var(--card); border-top: 1px solid var(--line);
+            padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
+            box-shadow: 0 -6px 20px rgba(15,23,42,.06);
+        }
+        .bottom-nav a, .bottom-nav button {
+            flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+            color: var(--muted); text-decoration: none; font-size: .72rem; font-weight: 600;
+            padding: 6px 0; background: none; border: 0;
+        }
+        .bottom-nav i { font-size: 1.35rem; }
+        .bottom-nav .active { color: var(--primary); }
+
+        /* ---------- البطاقات ---------- */
+        .card {
+            background: var(--card); color: var(--text);
+            border: 1px solid var(--line); border-radius: 18px;
+            box-shadow: var(--shadow);
+        }
+        .stat-card { min-height: 118px; position: relative; overflow: hidden; }
+        .stat-card h6 { color: var(--muted); font-weight: 600; font-size: .88rem; margin-bottom: .6rem; }
+        .stat-card h2, .stat-card h3 { font-size: 1.55rem; font-weight: 800; margin: 0; letter-spacing: -.3px; }
+        .stat-card small { display: block; margin-top: 6px; }
+        .stat-card .stat-icon {
+            position: absolute; top: 16px; left: 16px;
+            width: 40px; height: 40px; border-radius: 12px;
+            display: grid; place-items: center; font-size: 1.15rem;
+            background: var(--primary-soft); color: var(--primary);
+        }
+        .balance-card {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%) !important;
+            color: #fff !important; border: 0;
+        }
+        .balance-card h6, .balance-card small { color: rgba(255,255,255,.8) !important; }
+        .balance-card .stat-icon { background: rgba(255,255,255,.18); color: #fff; }
+
+        /* ---------- النماذج والأزرار ---------- */
+        .form-label { font-weight: 600; font-size: .9rem; color: var(--muted); margin-bottom: 6px; }
+        .form-control, .form-select {
+            border-radius: 12px; padding: 10px 14px; min-height: 46px;
+            background-color: var(--soft); border: 1px solid transparent; color: var(--text);
+        }
+        .form-control:focus, .form-select:focus {
+            background-color: var(--card); border-color: var(--primary);
+            box-shadow: 0 0 0 4px var(--primary-soft);
+        }
+        .form-control-sm { min-height: 38px; padding: 6px 10px; }
+        .btn { border-radius: 12px; font-weight: 600; padding: 10px 18px; }
+        .btn-sm { border-radius: 10px; padding: 6px 12px; font-size: .85rem; }
+        .btn-primary { background: var(--primary); border-color: var(--primary); }
+        .btn-primary:hover { background: #4338ca; border-color: #4338ca; }
+        .badge { font-weight: 600; padding: .45em .8em; border-radius: 999px; }
+        .alert { border-radius: 14px; border: 0; }
+
+        /* ---------- الجداول ---------- */
+        .table { --bs-table-bg: transparent; color: var(--text); vertical-align: middle; margin: 0; }
+        .table > :not(caption) > * > * { border-color: var(--line); padding: 12px 10px; color: var(--text); }
+        .table thead th {
+            color: var(--muted); font-weight: 700; font-size: .82rem;
+            background: var(--soft) !important; border: 0; white-space: nowrap;
+        }
+        .table thead th:first-child { border-radius: 0 10px 10px 0; }
+        .table thead th:last-child { border-radius: 10px 0 0 10px; }
+        .table-striped > tbody > tr:nth-of-type(odd) > * { --bs-table-bg-type: transparent; }
+        .table-hover > tbody > tr:hover > * { --bs-table-bg-state: var(--soft); }
+
+        /* ---------- الموبايل ---------- */
+        @media (max-width: 991px) {
+            .sidebar { display: none; }
+            .topbar { display: flex; }
+            .bottom-nav { display: flex; }
+            .main { padding: 16px 14px calc(96px + env(safe-area-inset-bottom)); }
+            .main.full { padding: 0; }
+            h2 { font-size: 1.3rem; }
+            .main > h2:first-child, .page-head h2 { display: none; }
+            .card.p-4 { padding: 18px !important; }
+            .stat-card { min-height: 104px; padding: 16px !important; }
+            .stat-card h2, .stat-card h3 { font-size: 1.2rem; }
+            .stat-card .stat-icon { width: 34px; height: 34px; top: 12px; left: 12px; font-size: 1rem; }
+            .filter-bar > * { max-width: none !important; flex: 1 1 100%; }
+            .page-head { justify-content: flex-end !important; }
+            .page-head > div, .page-head > div .btn { flex: 1; }
+            .page-head > div { display: flex; gap: 8px; }
+
+            /* تحويل الجداول إلى بطاقات */
+            .table thead { display: none; }
+            .table, .table tbody, .table tr, .table td { display: block; width: 100%; }
+            .table tr {
+                background: var(--soft); border-radius: 14px;
+                padding: 10px 14px; margin-bottom: 10px;
+            }
+            .table > :not(caption) > * > * {
+                border: 0; padding: 6px 0; background: transparent !important; box-shadow: none !important;
+            }
+            .table td[data-label] {
+                display: flex; justify-content: space-between; align-items: center; gap: 12px;
+                text-align: left;
+            }
+            .table td[data-label]::before {
+                content: attr(data-label); color: var(--muted);
+                font-weight: 600; font-size: .85rem; text-align: right; flex-shrink: 0;
+            }
+            .table td[data-label=""]::before { content: none; }
+            .table td[data-label=""] { justify-content: flex-start; gap: 6px; flex-wrap: wrap; padding-top: 10px; }
+            .table td[colspan] { text-align: center; background: transparent; }
+            .table td .form-control { max-width: 60%; background-color: var(--card); border-color: var(--line); }
+            .filter-bar > .btn { flex: 1 1 40%; }
+            .table-responsive { overflow: visible; }
+        }
+
         @media print {
-            .sidebar, .no-print, form { display: none !important; }
-            .col-md-10 { width: 100% !important; }
-            .card { box-shadow: none; }
+            .sidebar, .topbar, .bottom-nav, .no-print, form { display: none !important; }
+            .main { padding: 0; }
+            .card { box-shadow: none; border: 1px solid #ddd; }
         }
+
+        /* صفحة الدخول */
+        .login-wrap {
+            min-height: 100vh; display: grid; place-items: center; padding: 20px;
+            background:
+                radial-gradient(1000px 500px at 100% 0%, rgba(124,58,237,.18), transparent 60%),
+                radial-gradient(800px 500px at 0% 100%, rgba(79,70,229,.18), transparent 60%),
+                var(--bg);
+        }
+        .login-card { width: 100%; max-width: 410px; padding: 34px 28px !important; }
     </style>
 </head>
 
 <body>
-<div class="container-fluid">
-    <div class="row">
+{% set titles = {
+    'dashboard': 'الرئيسية', 'subscribers': 'المشتركون', 'subscriber_detail': 'تفاصيل المشترك',
+    'wallet': 'المحفظة', 'plans': 'الباقات والأسعار', 'reports': 'التقارير',
+    'settings': 'الإعدادات', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل اشتراك'
+} %}
+{% set ep = request.endpoint %}
 
-        {% if session.get('user_id') %}
-        <aside class="col-md-2 sidebar">
-            <h4 class="brand">📡 محاسبة الإنترنت</h4>
-            <div class="who">👤 {{ session.get('username') }}</div>
+{% if session.get('user_id') %}
+<div class="layout">
+    <aside class="sidebar">
+        <div class="brand"><span class="logo"><i class="bi bi-router"></i></span> محاسبة الإنترنت</div>
+        <nav class="nav-side">
+            <a href="{{ url_for('dashboard') }}" class="{{ 'active' if ep == 'dashboard' }}"><i class="bi bi-grid-1x2"></i> الرئيسية</a>
+            <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer'] }}"><i class="bi bi-people"></i> المشتركون</a>
+            <a href="{{ url_for('wallet') }}" class="{{ 'active' if ep == 'wallet' }}"><i class="bi bi-wallet2"></i> المحفظة</a>
+            <a href="{{ url_for('plans') }}" class="{{ 'active' if ep == 'plans' }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
+            <a href="{{ url_for('reports') }}" class="{{ 'active' if ep == 'reports' }}"><i class="bi bi-bar-chart-line"></i> التقارير</a>
+            <a href="{{ url_for('settings') }}" class="{{ 'active' if ep == 'settings' }}"><i class="bi bi-gear"></i> الإعدادات</a>
+        </nav>
+        <div class="side-foot nav-side">
+            <div class="who"><span class="avatar">{{ (session.get('username') or '?')[:1]|upper }}</span> {{ session.get('username') }}</div>
+            <a href="#" onclick="toggleTheme();return false;"><i class="bi bi-moon-stars"></i> الوضع الليلي</a>
+            <a href="{{ url_for('logout') }}"><i class="bi bi-box-arrow-left"></i> تسجيل الخروج</a>
+        </div>
+    </aside>
 
-            <a href="{{ url_for('dashboard') }}" class="{{ 'active' if request.endpoint == 'dashboard' }}">🏠 الرئيسية</a>
-            <a href="{{ url_for('subscribers') }}" class="{{ 'active' if request.endpoint == 'subscribers' }}">👥 المشتركون</a>
-            <a href="{{ url_for('wallet') }}" class="{{ 'active' if request.endpoint == 'wallet' }}">💰 المحفظة</a>
-            <a href="{{ url_for('plans') }}" class="{{ 'active' if request.endpoint == 'plans' }}">📦 الباقات والأسعار</a>
-            <a href="{{ url_for('reports') }}" class="{{ 'active' if request.endpoint == 'reports' }}">📊 التقارير</a>
-            <a href="{{ url_for('settings') }}" class="{{ 'active' if request.endpoint == 'settings' }}">⚙️ الإعدادات</a>
-            <a href="{{ url_for('logout') }}">🚪 تسجيل الخروج</a>
-        </aside>
-        {% endif %}
+    <div class="flex-grow-1" style="min-width:0">
+        <header class="topbar">
+            <div class="d-flex align-items-center gap-2">
+                <span class="brand p-0"><span class="logo" style="width:34px;height:34px;font-size:1rem"><i class="bi bi-router"></i></span></span>
+                <span class="title">{{ titles.get(ep, 'محاسبة الإنترنت') }}</span>
+            </div>
+            <div class="d-flex gap-2">
+                <button class="icon-btn" onclick="toggleTheme()" aria-label="الوضع الليلي"><i class="bi bi-moon-stars"></i></button>
+            </div>
+        </header>
 
-        <main class="{% if session.get('user_id') %}col-md-10{% else %}col-md-12{% endif %} content">
-
+        <main class="main">
             {% with messages = get_flashed_messages(with_categories=true) %}
                 {% for category, message in messages %}
                     <div class="alert alert-{{ 'info' if category == 'message' else category }} alert-dismissible fade show">
@@ -366,8 +586,42 @@ BASE_HTML = """
     </div>
 </div>
 
+<nav class="bottom-nav">
+    <a href="{{ url_for('dashboard') }}" class="{{ 'active' if ep == 'dashboard' }}"><i class="bi bi-grid-1x2{{ '-fill' if ep == 'dashboard' }}"></i>الرئيسية</a>
+    <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer'] }}"><i class="bi bi-people{{ '-fill' if ep in ['subscribers','subscriber_detail','activate','transfer'] }}"></i>المشتركون</a>
+    <a href="{{ url_for('wallet') }}" class="{{ 'active' if ep == 'wallet' }}"><i class="bi bi-wallet{{ '-fill' if ep == 'wallet' else '2' }}"></i>المحفظة</a>
+    <a href="{{ url_for('reports') }}" class="{{ 'active' if ep == 'reports' }}"><i class="bi bi-bar-chart-line{{ '-fill' if ep == 'reports' }}"></i>التقارير</a>
+    <button data-bs-toggle="offcanvas" data-bs-target="#more" class="{{ 'active' if ep in ['plans','settings'] }}"><i class="bi bi-three-dots"></i>المزيد</button>
+</nav>
+
+<div class="offcanvas offcanvas-bottom" tabindex="-1" id="more" style="height:auto;border-radius:22px 22px 0 0;background:var(--card)">
+    <div class="offcanvas-body nav-side pb-4">
+        <div class="who mb-2"><span class="avatar">{{ (session.get('username') or '?')[:1]|upper }}</span> {{ session.get('username') }}</div>
+        <a href="{{ url_for('plans') }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
+        <a href="{{ url_for('settings') }}"><i class="bi bi-gear"></i> الإعدادات والنسخ الاحتياطي</a>
+        <a href="#" onclick="toggleTheme();return false;"><i class="bi bi-moon-stars"></i> الوضع الليلي</a>
+        <a href="{{ url_for('logout') }}" class="text-danger"><i class="bi bi-box-arrow-left"></i> تسجيل الخروج</a>
+    </div>
+</div>
+{% else %}
+<main class="main full">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+            <div class="alert alert-{{ 'info' if category == 'message' else category }} m-3">{{ message }}</div>
+        {% endfor %}
+    {% endwith %}
+    {{ body|safe }}
+</main>
+{% endif %}
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
+    function toggleTheme() {
+        const el = document.documentElement;
+        const t = el.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark';
+        el.setAttribute('data-bs-theme', t);
+        try { localStorage.setItem('theme', t); } catch (e) {}
+    }
     // إضافة رمز الحماية لكل نموذج POST تلقائياً
     const token = document.querySelector('meta[name="csrf-token"]').content;
     document.querySelectorAll('form[method="post"]').forEach(f => {
@@ -378,6 +632,16 @@ BASE_HTML = """
     // تأكيد قبل الحذف
     document.querySelectorAll('[data-confirm]').forEach(el => {
         el.addEventListener('submit', e => { if (!confirm(el.dataset.confirm)) e.preventDefault(); });
+    });
+    // عناوين الأعمدة لعرض الجداول كبطاقات على الموبايل
+    document.querySelectorAll('table.table').forEach(t => {
+        const heads = [...t.querySelectorAll('thead th')].map(th => th.textContent.trim());
+        if (!heads.length) return;
+        t.querySelectorAll('tbody tr').forEach(tr => {
+            [...tr.children].forEach((td, i) => {
+                if (td.tagName === 'TD' && !td.hasAttribute('colspan')) td.dataset.label = heads[i] || '';
+            });
+        });
     });
 </script>
 </body>
@@ -390,27 +654,31 @@ def page(body):
 
 
 LOGIN_PAGE = """
-<div class="row justify-content-center mt-5">
-    <div class="col-md-5">
-        <div class="card p-4">
-            <h3 class="text-center mb-4">📡 تسجيل الدخول</h3>
-
-            <form method="post">
-                <label class="form-label">اسم المستخدم</label>
-                <input name="username" class="form-control mb-3" required autofocus>
-
-                <label class="form-label">كلمة المرور</label>
-                <input name="password" type="password" class="form-control mb-3" required>
-
-                <button class="btn btn-primary w-100">دخول</button>
-            </form>
-
-            {% if show_default %}
-            <div class="text-muted mt-3 text-center small">
-                الدخول الافتراضي: admin / admin123 — غيّرها من الإعدادات بعد الدخول
+<div class="login-wrap">
+    <div class="card login-card">
+        <div class="text-center mb-4">
+            <div class="brand justify-content-center p-0 mb-3">
+                <span class="logo" style="width:60px;height:60px;font-size:1.7rem;border-radius:18px"><i class="bi bi-router"></i></span>
             </div>
-            {% endif %}
+            <h3 class="mb-1">محاسبة الإنترنت</h3>
+            <div class="text-muted">سجّل دخولك للمتابعة</div>
         </div>
+
+        <form method="post">
+            <label class="form-label">اسم المستخدم</label>
+            <input name="username" class="form-control mb-3" required autofocus autocomplete="username">
+
+            <label class="form-label">كلمة المرور</label>
+            <input name="password" type="password" class="form-control mb-4" required autocomplete="current-password">
+
+            <button class="btn btn-primary w-100 py-3">دخول <i class="bi bi-arrow-left ms-1"></i></button>
+        </form>
+
+        {% if show_default %}
+        <div class="text-muted mt-4 text-center small">
+            الدخول الافتراضي: admin / admin123 — غيّرها من الإعدادات بعد الدخول
+        </div>
+        {% endif %}
     </div>
 </div>
 """
@@ -529,27 +797,31 @@ def dashboard():
     <h2 class="mb-4">لوحة التحكم</h2>
 
     <div class="row g-3 mb-4">
-        <div class="col-md-3">
+        <div class="col-6 col-md-3">
             <div class="card balance-card stat-card p-4">
-                <h6>رصيد المحفظة الحالي</h6>
+                <span class="stat-icon"><i class="bi bi-wallet2"></i></span>
+                <h6>رصيد المحفظة</h6>
                 <h2>{money(balance)} د.ع</h2>
             </div>
         </div>
-        <div class="col-md-3">
+        <div class="col-6 col-md-3">
             <div class="card stat-card p-4">
+                <span class="stat-icon"><i class="bi bi-people"></i></span>
                 <h6>عدد المشتركين</h6>
                 <h2>{subscribers_count}</h2>
             </div>
         </div>
-        <div class="col-md-3">
+        <div class="col-6 col-md-3">
             <div class="card stat-card p-4">
+                <span class="stat-icon" style="background:rgba(16,185,129,.14);color:#10b981"><i class="bi bi-graph-up-arrow"></i></span>
                 <h6>أرباح هذا الشهر</h6>
                 <h2 class="text-success">{money(month['profit'])} د.ع</h2>
                 <small class="text-muted">{month['ops']} عملية — مبيعات {money(month['sales'])} د.ع</small>
             </div>
         </div>
-        <div class="col-md-3">
+        <div class="col-6 col-md-3">
             <div class="card stat-card p-4">
+                <span class="stat-icon" style="background:rgba(245,158,11,.14);color:#f59e0b"><i class="bi bi-trophy"></i></span>
                 <h6>إجمالي الأرباح</h6>
                 <h2>{money(stats['total_profit'])} د.ع</h2>
                 <small class="text-muted">تفعيل: {stats['activations'] or 0} — ترحيل: {stats['transfers'] or 0}</small>
@@ -558,7 +830,7 @@ def dashboard():
     </div>
 
     <div class="card p-4 mb-4">
-        <h5>⏰ اشتراكات منتهية أو تنتهي خلال {EXPIRY_WARNING_DAYS} أيام</h5>
+        <h5><i class="bi bi-alarm text-warning"></i> اشتراكات منتهية أو تنتهي خلال {EXPIRY_WARNING_DAYS} أيام</h5>
         <div class="table-responsive">
             <table class="table table-hover">
                 <thead><tr><th>الاسم</th><th>اليوزر</th><th>الهاتف</th><th>الاشتراك</th>
@@ -569,7 +841,7 @@ def dashboard():
     </div>
 
     <div class="card p-4">
-        <h5>آخر العمليات</h5>
+        <h5><i class="bi bi-clock-history text-primary"></i> آخر العمليات</h5>
         <div class="table-responsive">
             <table class="table table-striped">
                 <thead><tr><th>العملية</th><th>اليوزر</th><th>الاشتراك</th><th>المبلغ</th><th>التاريخ</th></tr></thead>
@@ -799,8 +1071,12 @@ def subscribers():
     <h2 class="mb-4">المشتركون</h2>
 
     <div class="card p-4 mb-4">
-        <h5>إضافة مشترك جديد</h5>
-        <form method="post" class="row g-3 mt-1">
+        <button class="btn btn-primary w-100 d-flex align-items-center justify-content-center gap-2" type="button"
+                data-bs-toggle="collapse" data-bs-target="#addSub">
+            <i class="bi bi-person-plus"></i> إضافة مشترك جديد
+        </button>
+        <div class="collapse" id="addSub">
+        <form method="post" class="row g-3 mt-2">
             <div class="col-md-4">
                 <label class="form-label">اسم المشترك</label>
                 <input name="name" class="form-control" required>
@@ -834,13 +1110,14 @@ def subscribers():
                 <small class="text-muted ms-2">الإضافة لا تخصم من المحفظة — استخدم زر "تفعيل" للخصم.</small>
             </div>
         </form>
+        </div>
     </div>
 
     <div class="card p-4">
         <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
             <h5 class="mb-0">قائمة المشتركين ({len(subscriber_rows)})</h5>
-            <form method="get" class="d-flex flex-wrap gap-2">
-                <input name="q" value="{esc(q)}" class="form-control" placeholder="🔍 بحث بالاسم/اليوزر/الهاتف" style="max-width:240px">
+            <form method="get" class="d-flex flex-wrap gap-2 filter-bar">
+                <input name="q" value="{esc(q)}" class="form-control" placeholder="بحث بالاسم/اليوزر/الهاتف" style="max-width:240px">
                 <select name="status" class="form-select" style="max-width:150px">
                     <option value="">كل الحالات</option>
                     <option value="active" {"selected" if status == "active" else ""}>فعّال</option>
@@ -936,11 +1213,11 @@ def subscriber_detail(subscriber_id):
         delete_html = f"""
         <form method="post" action="{url_for('delete_subscriber', subscriber_id=subscriber_id)}"
               data-confirm="متأكد تريد تحذف هذا المشترك؟">
-            <button class="btn btn-outline-danger">🗑️ حذف المشترك</button>
+            <button class="btn btn-outline-danger"><i class="bi bi-trash3"></i> حذف المشترك</button>
         </form>"""
 
     body = f"""
-    <div class="d-flex justify-content-between align-items-center mb-4">
+    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4 page-head">
         <h2 class="mb-0">المشترك: {esc(s['name'])}</h2>
         <div>
             <a href="{url_for('activate', subscriber_id=subscriber_id)}" class="btn btn-success">تفعيل</a>
@@ -950,10 +1227,10 @@ def subscriber_detail(subscriber_id):
     </div>
 
     <div class="row g-3 mb-4">
-        <div class="col-md-4"><div class="card p-3"><h6>الحالة</h6><div>{status_badge(s['expiry_date'])}</div>
+        <div class="col-12 col-md-4"><div class="card stat-card p-3"><h6>الحالة</h6><div>{status_badge(s['expiry_date'])}</div>
             <small class="text-muted">ينتهي: {esc(s['expiry_date'])}</small></div></div>
-        <div class="col-md-4"><div class="card p-3"><h6>مجموع المبيعات له</h6><h4>{money(total_paid)} د.ع</h4></div></div>
-        <div class="col-md-4"><div class="card p-3"><h6>مجموع الأرباح منه</h6><h4 class="text-success">{money(total_profit)} د.ع</h4></div></div>
+        <div class="col-6 col-md-4"><div class="card stat-card p-3"><h6>مجموع المبيعات له</h6><h4 class="fw-bold">{money(total_paid)} د.ع</h4></div></div>
+        <div class="col-6 col-md-4"><div class="card stat-card p-3"><h6>مجموع الأرباح منه</h6><h4 class="text-success fw-bold">{money(total_profit)} د.ع</h4></div></div>
     </div>
 
     <div class="card p-4 mb-4">
@@ -1380,9 +1657,9 @@ def reports():
     qs = f"?from={start}&to={end}"
 
     body = f"""
-    <div class="d-flex justify-content-between align-items-center mb-4">
+    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4 page-head">
         <h2 class="mb-0">التقارير</h2>
-        <button onclick="window.print()" class="btn btn-outline-secondary no-print">🖨️ طباعة</button>
+        <button onclick="window.print()" class="btn btn-outline-secondary no-print"><i class="bi bi-printer"></i> طباعة</button>
     </div>
 
     <div class="card p-4 mb-4 no-print">
@@ -1392,9 +1669,9 @@ def reports():
             <div class="col-md-3"><label class="form-label">إلى تاريخ</label>
                 <input type="date" name="to" value="{end}" class="form-control"></div>
             <div class="col-md-2"><button class="btn btn-primary w-100">عرض</button></div>
-            <div class="col-md-4 text-end">
-                <a href="{url_for('export_activations')}{qs}" class="btn btn-success">📥 Excel العمليات</a>
-                <a href="{url_for('export_charges')}{qs}" class="btn btn-primary">📥 Excel المحفظة</a>
+            <div class="col-md-4 d-flex flex-wrap gap-2 justify-content-md-end">
+                <a href="{url_for('export_activations')}{qs}" class="btn btn-success"><i class="bi bi-file-earmark-excel"></i> Excel العمليات</a>
+                <a href="{url_for('export_charges')}{qs}" class="btn btn-primary"><i class="bi bi-file-earmark-excel"></i> Excel المحفظة</a>
             </div>
         </form>
     </div>
@@ -1402,10 +1679,10 @@ def reports():
     <p class="text-muted">الفترة: من <b>{start}</b> إلى <b>{end}</b></p>
 
     <div class="row g-3 mb-4">
-        <div class="col-md-3"><div class="card p-3"><h6>عدد العمليات</h6><h3>{len(activations)}</h3></div></div>
-        <div class="col-md-3"><div class="card p-3"><h6>المبيعات</h6><h3>{money(total_sales)}</h3></div></div>
-        <div class="col-md-3"><div class="card p-3"><h6>الخصم من المحفظة</h6><h3 class="text-danger">{money(total_cost)}</h3></div></div>
-        <div class="col-md-3"><div class="card p-3"><h6>صافي الربح</h6><h3 class="text-success">{money(total_profit)}</h3></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>عدد العمليات</h6><h3>{len(activations)}</h3></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>المبيعات</h6><h3>{money(total_sales)}</h3></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>الخصم من المحفظة</h6><h3 class="text-danger">{money(total_cost)}</h3></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>صافي الربح</h6><h3 class="text-success">{money(total_profit)}</h3></div></div>
     </div>
 
     <div class="card p-4 mb-4">
@@ -1570,7 +1847,7 @@ def settings():
     <div class="row g-4">
         <div class="col-md-6">
             <div class="card p-4 h-100">
-                <h5>🔑 تغيير كلمة المرور</h5>
+                <h5><i class="bi bi-key text-primary"></i> تغيير كلمة المرور</h5>
                 <form method="post">
                     <input type="hidden" name="action" value="password">
                     <label class="form-label">كلمة المرور الحالية</label>
@@ -1586,7 +1863,7 @@ def settings():
 
         <div class="col-md-6">
             <div class="card p-4 h-100">
-                <h5>👤 المستخدمون</h5>
+                <h5><i class="bi bi-person-badge text-primary"></i> المستخدمون</h5>
                 <table class="table"><tbody>{user_rows}</tbody></table>
                 <form method="post" class="row g-2">
                     <input type="hidden" name="action" value="add_user">
@@ -1599,9 +1876,9 @@ def settings():
 
         <div class="col-12">
             <div class="card p-4">
-                <h5>💾 النسخ الاحتياطي</h5>
+                <h5><i class="bi bi-cloud-arrow-down text-primary"></i> النسخ الاحتياطي</h5>
                 <p class="text-muted mb-3">نزّل نسخة كاملة من قاعدة البيانات واحتفظ بيها بمكان آمن (يُنصح بعمل نسخة كل أسبوع).</p>
-                <div><a href="{url_for('backup')}" class="btn btn-dark">تحميل نسخة احتياطية</a></div>
+                <div><a href="{url_for('backup')}" class="btn btn-dark"><i class="bi bi-download"></i> تحميل نسخة احتياطية</a></div>
             </div>
         </div>
     </div>
