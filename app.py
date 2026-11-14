@@ -295,6 +295,11 @@ DEBT_SUBQUERY = """
     SELECT COALESCE(SUM(a.amount), 0) FROM activations a
     WHERE a.subscriber_id = s.id AND a.payment_type = 'دين'
 """
+# مبلغ الدين بسعر البيع (للرسائل الي تنرسل للمشترك)
+DEBT_SALE_SUBQUERY = """
+    SELECT COALESCE(SUM(a.retail_price), 0) FROM activations a
+    WHERE a.subscriber_id = s.id AND a.payment_type = 'دين'
+"""
 # المسدد من قبلي لهذا المشترك = مجموع أسعار التفعيلات "من قبلي"
 SELF_SUBQUERY = """
     SELECT COALESCE(SUM(a.retail_price), 0) FROM activations a
@@ -1466,7 +1471,7 @@ def subscribers():
     plans_list = con.execute("SELECT * FROM plans ORDER BY category, id").fetchall()
     subscriber_rows = con.execute(f"""
         SELECT s.*, p.name AS plan_name, p.retail_price, p.wholesale_price, p.profit,
-               ({DEBT_SUBQUERY}) AS debt, ({SELF_SUBQUERY}) AS self_paid
+               ({DEBT_SUBQUERY}) AS debt, ({DEBT_SALE_SUBQUERY}) AS debt_sale, ({SELF_SUBQUERY}) AS self_paid
         FROM subscribers s
         JOIN plans p ON p.id = s.plan_id
         {"WHERE " + " AND ".join(where) if where else ""}
@@ -1480,7 +1485,7 @@ def subscribers():
     for s in subscriber_rows:
         debt = s["debt"] or 0
         pending = debt or s["self_paid"]
-        wa_text = msg_debt(s, debt, shop) if debt > 0 else msg_reminder(s, shop)
+        wa_text = msg_debt(s, s["debt_sale"], shop) if debt > 0 else msg_reminder(s, shop)
         subscriber_html += f"""
         <tr>
             <td><input type="checkbox" name="ids" value="{s['id']}" form="bulkForm" class="form-check-input bulk-check" onchange="bulkCount()"></td>
@@ -1643,7 +1648,7 @@ def get_subscriber(con, subscriber_id):
     return con.execute(f"""
         SELECT s.*, p.name AS plan_name, p.category,
                p.retail_price, p.wholesale_price, p.profit, p.self_price,
-               ({DEBT_SUBQUERY}) AS debt, ({SELF_SUBQUERY}) AS self_paid
+               ({DEBT_SUBQUERY}) AS debt, ({DEBT_SALE_SUBQUERY}) AS debt_sale, ({SELF_SUBQUERY}) AS self_paid
         FROM subscribers s
         JOIN plans p ON p.id = s.plan_id
         WHERE s.id = ?
@@ -1703,7 +1708,7 @@ def subscriber_detail(subscriber_id):
                         <h5 class="mb-1 text-success"><i class="bi bi-check-circle-fill"></i> تمت عملية {esc(op['operation_type'])} بنجاح</h5>
                         <div class="text-muted">حالة الدفع: {payment_badge(op['payment_type'])} — سعر البيع {money(op['retail_price'])} د.ع</div>
                     </div>
-                    {wa_button(s['phone'], msg_confirm(s, op, s['debt'] or 0, shop), 'أرسل تأكيد للمشترك', 'btn-lg')}
+                    {wa_button(s['phone'], msg_confirm(s, op, s['debt_sale'] or 0, shop), 'أرسل تأكيد للمشترك', 'btn-lg')}
                 </div>
             </div>"""
     con.close()
@@ -1786,7 +1791,7 @@ def subscriber_detail(subscriber_id):
         {"<p class='text-muted mb-0'>أضف رقم هاتف للمشترك حتى تكدر تراسله.</p>" if not wa_phone(s['phone']) else f'''
         <div class="d-flex flex-wrap gap-2 mb-3">
             <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setMsg(this)" data-msg="{esc(msg_reminder(s, shop))}">تذكير بانتهاء الاشتراك</button>
-            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setMsg(this)" data-msg="{esc(msg_debt(s, debt, shop))}">مطالبة بالدين</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setMsg(this)" data-msg="{esc(msg_debt(s, s['debt_sale'], shop))}">مطالبة بالدين</button>
             <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setMsg(this)" data-msg="{esc(msg_activated(s, shop))}">تأكيد التفعيل</button>
         </div>
         <textarea id="waText" class="form-control mb-3" rows="4" placeholder="اكتب رسالتك هنا...">{esc(msg_reminder(s, shop))}</textarea>
@@ -2178,14 +2183,16 @@ def debts():
     total_debt = sum(o["amount"] or 0 for o in debt_ops)
     total_self = sum(o["retail_price"] or 0 for o in self_ops)
     debt_by_sub = {}
+    sale_by_sub = {}  # بسعر البيع — للرسالة الي تنرسل للمشترك
     for o in debt_ops:
         debt_by_sub[o["subscriber_id"]] = debt_by_sub.get(o["subscriber_id"], 0) + (o["amount"] or 0)
+        sale_by_sub[o["subscriber_id"]] = sale_by_sub.get(o["subscriber_id"], 0) + (o["retail_price"] or 0)
 
     def rows(ops, kind):
         html = ""
         for o in ops:
             amount = o["amount"] if kind == PAY_DEBT else o["retail_price"]
-            wa = wa_button(o["phone"], msg_debt(o, debt_by_sub.get(o["subscriber_id"], 0), shop), '') if kind == PAY_DEBT else ""
+            wa = wa_button(o["phone"], msg_debt(o, sale_by_sub.get(o["subscriber_id"], 0), shop), '') if kind == PAY_DEBT else ""
             html += f"""
             <tr>
                 <td><a href="{url_for('subscriber_detail', subscriber_id=o['subscriber_id'])}" class="fw-bold text-decoration-none">{esc(o['name'])}</a></td>
