@@ -281,6 +281,36 @@ SELF_SUBQUERY = """
 """
 
 
+PREV_OP = "اشتراك سابق"
+
+
+def record_previous(con, subscriber_id, plan_id, start, retail, payment_type, wholesale=None, notes=""):
+    """تسجيل اشتراك سابق (مفعّل من قبل) بدون خصم من المحفظة.
+    يرجع False إذا عنده عملية بنفس التاريخ (حتى ما يتكرر)."""
+    plan = con.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+    if not plan or payment_type not in PAY_TYPES:
+        return False
+    if con.execute("SELECT 1 FROM activations WHERE subscriber_id = ? AND substr(operation_date, 1, 10) = ?",
+                   (subscriber_id, start)).fetchone():
+        return False
+    wholesale = plan["wholesale_price"] if wholesale is None else wholesale
+    retail = plan["retail_price"] if retail is None else retail
+    when = f"{start} 00:00:00"
+    con.execute("""
+        INSERT INTO activations
+        (subscriber_id, plan_id, operation_type, amount, retail_price, profit,
+         payment_type, paid_amount, settled_at, notes, operation_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (subscriber_id, plan_id, PREV_OP, wholesale, retail, retail - wholesale, payment_type,
+          retail if payment_type == PAY_CASH else 0,
+          None if payment_type == PAY_DEBT else when, notes, when))
+    con.execute("""
+        UPDATE subscribers SET plan_id = ?, activation_date = ?, expiry_date = ?
+        WHERE id = ? AND (activation_date IS NULL OR activation_date <= ?)
+    """, (plan_id, start, expiry_from(start), subscriber_id, start))
+    return True
+
+
 def quick_prices(con, retail=None):
     """أسعار البيع السريعة (من الإعدادات) + سعر الباقة."""
     raw = get_setting(con, "quick_prices", "38000,40000")
@@ -622,6 +652,10 @@ BASE_HTML = """
         .btn-check:checked + .pay-opt.debt { border-color: #ef4444; background: rgba(239,68,68,.08); }
         .btn-check:checked + .pay-opt.self { border-color: #0ea5e9; background: rgba(14,165,233,.08); }
         @media (max-width: 400px) { .pay-opt { padding: 12px 4px; } .pay-opt small { font-size: .72rem; } }
+        .bulk-bar { display: none; position: sticky; bottom: 12px; z-index: 1010; margin-top: 12px;
+                    border: 2px solid #f59e0b; }
+        .bulk-bar.show { display: block; }
+        @media (max-width: 991px) { .bulk-bar { bottom: calc(80px + env(safe-area-inset-bottom)); } }
         .badge { font-weight: 600; padding: .45em .8em; border-radius: 999px; }
         .alert { border-radius: 14px; border: 0; }
 
@@ -1262,7 +1296,7 @@ def price_field_html(price, prices):
     return f"""
         <label class="form-label">سعر البيع للمشترك</label>
         <input type="number" name="retail_price" min="0" value="{price}" class="form-control mb-2"
-               inputmode="numeric" oninput="payCalc(this.form)" required>
+               inputmode="numeric" oninput="payCalc(this.form)">
         <div class="d-flex flex-wrap gap-2 mb-3">{chips}</div>"""
 
 
@@ -1272,11 +1306,11 @@ PAY_CALC_JS = """
     function payCalc(f) {
         const sel = f.querySelector('select[name=plan_id]');
         let wholesale = +f.dataset.wholesale || 0;
-        if (sel) {
-            const o = sel.selectedOptions[0];
+        const o = sel && sel.selectedOptions[0];
+        if (o && o.dataset.wholesale) {
             wholesale = +o.dataset.wholesale;
             if (f.dataset.lastPlan !== sel.value) {
-                if (f.dataset.lastPlan) f.retail_price.value = o.dataset.retail;
+                if (f.dataset.lastPlan !== undefined || !f.retail_price.value) f.retail_price.value = o.dataset.retail;
                 f.dataset.lastPlan = sel.value;
             }
         }
@@ -1314,19 +1348,31 @@ def subscribers():
 
         dup = con.execute("SELECT 1 FROM subscribers WHERE username = ?", (data["username"],)).fetchone()
 
-        con.execute("""
+        cur = con.execute("""
             INSERT INTO subscribers
             (name, username, phone, plan_id, activation_date, expiry_date, notes, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (data["name"], data["username"], data["phone"], data["plan_id"],
               data["activation_date"], data["expiry_date"], data["notes"], now_str()))
+        new_id = cur.lastrowid
+
+        after = request.form.get("after", "save")
+        msg = "تم حفظ بيانات المشترك (بدون أي خصم)"
+        if after == "previous":
+            ptype = request.form.get("payment_type", PAY_DEBT)
+            retail = parse_amount(request.form.get("retail_price"))
+            if record_previous(con, new_id, data["plan_id"], data["activation_date"], retail, ptype):
+                msg = f"تم حفظ المشترك وتسجيل اشتراكه السابق كـ ({ptype}) بدون خصم من المحفظة"
         con.commit()
         con.close()
 
-        flash("تمت إضافة المشترك بنجاح", "success")
         if dup:
             flash("تنبيه: يوجد مشترك آخر بنفس اليوزر", "warning")
-        return redirect(url_for("subscribers"))
+        if after == "activate":
+            flash("تم حفظ المشترك — كمّل التفعيل (يخصم من المحفظة)", "success")
+            return redirect(url_for("activate", subscriber_id=new_id))
+        flash(msg, "success")
+        return redirect(url_for("subscriber_detail", subscriber_id=new_id) if after == "previous" else url_for("subscribers"))
 
     q = (request.args.get("q") or "").strip()
     status = request.args.get("status", "")
@@ -1361,6 +1407,7 @@ def subscribers():
         ORDER BY s.id DESC
     """, params).fetchall()
     shop = get_setting(con, "shop_name")
+    quick_prices_list = quick_prices(con)
     con.close()
 
     subscriber_html = ""
@@ -1370,6 +1417,7 @@ def subscribers():
         wa_text = msg_debt(s, debt, shop) if debt > 0 else msg_reminder(s, shop)
         subscriber_html += f"""
         <tr>
+            <td><input type="checkbox" name="ids" value="{s['id']}" form="bulkForm" class="form-check-input bulk-check" onchange="bulkCount()"></td>
             <td><a href="{url_for('subscriber_detail', subscriber_id=s['id'])}" class="fw-bold text-decoration-none">{esc(s['name'])}</a></td>
             <td>{esc(s['username'])}</td>
             <td dir="ltr">{esc(s['phone'])}</td>
@@ -1403,13 +1451,36 @@ def subscribers():
             <i class="bi bi-file-earmark-arrow-up"></i> استيراد يوزرات من ملف الشركة (PDF)
         </a>
         <div class="collapse" id="addSub">
-        <form method="post" class="row g-3 mt-2">
+        <form method="post" class="row g-3 mt-2 pay-form">
             {subscriber_form_fields(plans_list)}
             <div class="col-12">
-                <button class="btn btn-primary">حفظ المشترك</button>
-                <small class="text-muted ms-2">الإضافة لا تخصم من المحفظة — استخدم زر "تفعيل" للخصم.</small>
+                <label class="form-label">بعد الحفظ</label>
+                <div class="pay-options">
+                    <input type="radio" class="btn-check" name="after" id="afSave" value="save" checked onchange="afterMode(this.form)">
+                    <label class="pay-opt" for="afSave"><i class="bi bi-floppy" style="color:#64748b"></i><b>حفظ فقط</b><small>بيانات بدون أي خصم</small></label>
+                    <input type="radio" class="btn-check" name="after" id="afPrev" value="previous" onchange="afterMode(this.form)">
+                    <label class="pay-opt debt" for="afPrev"><i class="bi bi-clock-history"></i><b>اشتراك سابق</b><small>مفعّل من قبل — بدون خصم</small></label>
+                    <input type="radio" class="btn-check" name="after" id="afAct" value="activate" onchange="afterMode(this.form)">
+                    <label class="pay-opt" for="afAct"><i class="bi bi-lightning-charge"></i><b>تفعيل الآن</b><small>يخصم من المحفظة</small></label>
+                </div>
+            </div>
+            <div class="col-12 prev-box" style="display:none">
+                <div class="alert alert-warning small mb-3">يتسجل اشتراكه من <b>تاريخ التفعيل</b> المكتوب فوك، وما ينخصم شي من المحفظة.
+                اختار حالة الدفع: إذا بعده ما دافع اختار <b>دين</b>.</div>
+                {price_field_html('', quick_prices_list)}
+                <div class="mb-3">{pay_choice_html(PAY_DEBT, prefix='add')}</div>
+                <div class="alert pay-summary mb-0" style="background:var(--soft)"></div>
+            </div>
+            <div class="col-12">
+                <button class="btn btn-primary px-4">حفظ المشترك</button>
             </div>
         </form>
+        <script>
+            function afterMode(f) {{
+                f.querySelector('.prev-box').style.display = f.after.value === 'previous' ? '' : 'none';
+                payCalc(f);
+            }}
+        </script>
         </div>
     </div>
 
@@ -1437,16 +1508,69 @@ def subscribers():
             <table class="table table-hover">
                 <thead>
                     <tr>
-                        <th>الاسم</th><th>اليوزر</th><th>الهاتف</th><th>الاشتراك</th>
+                        <th></th><th>الاسم</th><th>اليوزر</th><th>الهاتف</th><th>الاشتراك</th>
                         <th>الحالة</th><th>الحساب</th><th></th>
                     </tr>
                 </thead>
-                <tbody>{subscriber_html or '<tr><td colspan="7" class="text-muted text-center">لا يوجد مشتركون</td></tr>'}</tbody>
+                <tbody>{subscriber_html or '<tr><td colspan="8" class="text-muted text-center">لا يوجد مشتركون</td></tr>'}</tbody>
             </table>
         </div>
     </div>
+
+    <form method="post" action="{url_for('bulk_previous')}" id="bulkForm" class="bulk-bar card p-3"
+          data-confirm="راح يتسجل الاشتراك الحالي للمشتركين المحددين بدون خصم من المحفظة. متأكد؟">
+        <div class="d-flex flex-wrap align-items-center gap-2">
+            <div class="form-check me-2">
+                <input class="form-check-input" type="checkbox" id="bulkAll"
+                       onchange="document.querySelectorAll('.bulk-check').forEach(c => c.checked = this.checked); bulkCount()">
+                <label class="form-check-label" for="bulkAll">الكل</label>
+            </div>
+            <b><span id="bulkN">0</span> محدد</b>
+            <span class="text-muted small">سجّل اشتراكهم الحالي (بدون خصم) كـ</span>
+            <select name="payment_type" class="form-select form-select-sm" style="width:auto">
+                <option value="دين">دين</option>
+                <option value="نقد">نقد</option>
+                <option value="من قبلي">من قبلي</option>
+            </select>
+            <button class="btn btn-sm btn-warning"><i class="bi bi-check2-all"></i> تسجيل</button>
+        </div>
+    </form>
+    <script>
+        function bulkCount() {{
+            const n = document.querySelectorAll('.bulk-check:checked').length;
+            document.getElementById('bulkN').textContent = n;
+            document.getElementById('bulkForm').classList.toggle('show', n > 0);
+        }}
+    </script>
+    {PAY_CALC_JS}
     """
     return page(body)
+
+
+@app.route("/subscribers/bulk-previous", methods=["POST"])
+@login_required
+def bulk_previous():
+    ids = [int(i) for i in request.form.getlist("ids") if i.isdigit()]
+    ptype = request.form.get("payment_type", PAY_DEBT)
+    if not ids or ptype not in PAY_TYPES:
+        flash("حدد مشتركين أولاً", "warning")
+        return redirect(url_for("subscribers"))
+    con = db()
+    done = skipped = 0
+    for sid in ids:
+        s = con.execute("SELECT * FROM subscribers WHERE id = ?", (sid,)).fetchone()
+        start = parse_date(s["activation_date"]) if s else None
+        if s and start and record_previous(con, sid, s["plan_id"], start, None, ptype):
+            done += 1
+        else:
+            skipped += 1
+    con.commit()
+    con.close()
+    msg = f"تم تسجيل اشتراك {done} مشترك كـ ({ptype}) بدون خصم من المحفظة"
+    if skipped:
+        msg += f" — تخطي {skipped} (عندهم عملية مسجلة بنفس تاريخ التفعيل)"
+    flash(msg, "success" if done else "warning")
+    return redirect(request.referrer if (request.referrer or "").startswith(request.host_url) else url_for("subscribers"))
 
 
 def get_subscriber(con, subscriber_id):
@@ -1495,6 +1619,7 @@ def subscriber_detail(subscriber_id):
         WHERE a.subscriber_id = ? ORDER BY a.id DESC
     """, (subscriber_id,)).fetchall()
     shop = get_setting(con, "shop_name")
+    prev_prices = quick_prices(con, s["retail_price"])
 
     # رسالة تأكيد بعد عملية تفعيل مباشرة
     done_html = ""
@@ -1571,6 +1696,26 @@ def subscriber_detail(subscriber_id):
     </div>
 
     <div class="card p-4 mb-4">
+        <h5><i class="bi bi-clock-history text-warning"></i> تسجيل اشتراك سابق (بدون خصم من المحفظة)</h5>
+        <p class="text-muted small">للمشترك الي مفعّل من قبل وما سجلته — مثلاً بعده ما دافع، سجّله <b>دين</b> حتى ينحسب بالديون.</p>
+        <form method="post" action="{url_for('add_previous', subscriber_id=subscriber_id)}" class="row g-3 pay-form">
+            <div class="col-md-6">
+                <label class="form-label">الباقة</label>
+                <select name="plan_id" class="form-select" onchange="payCalc(this.form)">{plan_options(plans_list, s['plan_id'])}</select>
+            </div>
+            <div class="col-md-6">
+                <label class="form-label">تاريخ التفعيل</label>
+                <input type="date" name="start" value="{esc(s['activation_date'])}" class="form-control" required>
+            </div>
+            <div class="col-12">{price_field_html(s['retail_price'], prev_prices)}
+                <div class="mb-3">{pay_choice_html(PAY_DEBT, prefix='prev')}</div>
+                <div class="alert pay-summary mb-3" style="background:var(--soft)"></div>
+                <button class="btn btn-warning"><i class="bi bi-check2"></i> تسجيل الاشتراك السابق</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="card p-4 mb-4">
         <h5><i class="bi bi-whatsapp" style="color:#25D366"></i> مراسلة المشترك على واتساب</h5>
         {"<p class='text-muted mb-0'>أضف رقم هاتف للمشترك حتى تكدر تراسله.</p>" if not wa_phone(s['phone']) else f'''
         <div class="d-flex flex-wrap gap-2 mb-3">
@@ -1604,8 +1749,38 @@ def subscriber_detail(subscriber_id):
             {delete_form(subscriber_id, cls='')}
         </div>
     </div>
+    {PAY_CALC_JS}
     """
     return page(body)
+
+
+@app.route("/subscribers/<int:subscriber_id>/previous", methods=["POST"])
+@login_required
+def add_previous(subscriber_id):
+    start = parse_date(request.form.get("start"))
+    retail = parse_amount(request.form.get("retail_price"))
+    ptype = request.form.get("payment_type", PAY_DEBT)
+    try:
+        plan_id = int(request.form.get("plan_id", ""))
+    except ValueError:
+        plan_id = None
+    back = url_for("subscriber_detail", subscriber_id=subscriber_id)
+    if not start or plan_id is None or retail is None or retail < 0:
+        flash("أدخل التاريخ والسعر بشكل صحيح", "danger")
+        return redirect(back)
+    con = db()
+    if not con.execute("SELECT 1 FROM subscribers WHERE id = ?", (subscriber_id,)).fetchone():
+        con.close()
+        flash("المشترك غير موجود", "danger")
+        return redirect(url_for("subscribers"))
+    ok = record_previous(con, subscriber_id, plan_id, start, retail, ptype)
+    con.commit()
+    con.close()
+    if ok:
+        flash(f"تم تسجيل الاشتراك السابق ({start}) كـ ({ptype}) بدون خصم من المحفظة", "success")
+    else:
+        flash("عنده عملية مسجلة بنفس التاريخ أو البيانات غير صحيحة — ما تسجل شي", "warning")
+    return redirect(back)
 
 
 @app.route("/subscribers/<int:subscriber_id>/delete", methods=["POST"])
@@ -1796,7 +1971,7 @@ def settle_card(op, prices, next_url):
         </div>
         <form method="post" action="{url_for('settle_operation', op_id=op['id'])}" class="pay-form" data-wholesale="{op['amount']}">
             <input type="hidden" name="next" value="{esc(next_url)}">
-            <div class="text-muted small mb-2">سعر الجملة (المخصوم من المحفظة): <b>{money(op['amount'])} د.ع</b></div>
+            <div class="text-muted small mb-2">سعر الجملة: <b>{money(op['amount'])} د.ع</b></div>
             {price_field_html(op['retail_price'], prices)}
             <label class="form-label">حالة الدفع الجديدة</label>
             <div class="mb-3">{pay_choice_html(PAY_CASH, prefix=str(op['id']))}</div>
@@ -2266,6 +2441,8 @@ def import_users():
             rows = json.load(f)["rows"]
 
         update_existing = request.form.get("update_existing") == "1"
+        prev_type = request.form.get("prev_type", "")
+        recorded = 0
         profit = parse_amount(request.form.get("profit"))
         profit = PROFIT if profit is None or profit < 0 else profit
 
@@ -2311,13 +2488,18 @@ def import_users():
                     WHERE id = ?
                 """, (plan_id, start, expiry, name, existing["id"]))
                 updated += 1
+                sid = existing["id"]
             else:
-                con.execute("""
+                cur = con.execute("""
                     INSERT INTO subscribers
                     (name, username, phone, plan_id, activation_date, expiry_date, notes, created_at)
                     VALUES (?, ?, '', ?, ?, ?, ?, ?)
                 """, (name, r["username"], plan_id, start, expiry, "", now))
                 added += 1
+                sid = cur.lastrowid
+            if prev_type in PAY_TYPES and record_previous(
+                    con, sid, plan_id, start, None, prev_type, wholesale=r["amount"] or None):
+                recorded += 1
         con.commit()
         con.close()
         try:
@@ -2330,6 +2512,8 @@ def import_users():
             msg += f"، تحديث {updated}"
         if skipped:
             msg += f"، تخطي {skipped}"
+        if recorded:
+            msg += f" — وتسجيل {recorded} اشتراك كـ ({prev_type}) بدون خصم من المحفظة"
         if created_plans:
             msg += f" — وأُضيفت {created_plans} باقة جديدة (راجع أسعارها من صفحة الباقات)"
         flash(msg, "success")
@@ -2412,7 +2596,16 @@ def import_users():
                         <label class="form-label">الربح للباقات الجديدة</label>
                         <input type="number" name="profit" min="0" value="{PROFIT}" class="form-control">
                     </div>
-                    <div class="col-md-8 d-flex align-items-end">
+                    <div class="col-md-8">
+                        <label class="form-label">تسجيل اشتراكاتهم بالحسابات (بدون خصم من المحفظة)</label>
+                        <select name="prev_type" class="form-select">
+                            <option value="دين" selected>سجّلها دين (ما استلمت منهم بعد)</option>
+                            <option value="نقد">سجّلها نقد (استلمت منهم)</option>
+                            <option value="من قبلي">سجّلها من قبلي</option>
+                            <option value="">لا تسجّل — بس أضيف البيانات</option>
+                        </select>
+                    </div>
+                    <div class="col-12">
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" name="update_existing" value="1" id="upd" checked>
                             <label class="form-check-label" for="upd">
@@ -2464,7 +2657,7 @@ def import_users():
         <ul class="text-muted small mt-3 mb-0">
             <li>ما ينضاف شي قبل ما تأكد بالمعاينة.</li>
             <li>اليوزر المكرر بالملف ينحسب مرة وحدة بآخر تاريخ.</li>
-            <li>الاستيراد ما يخصم من المحفظة وما يسجل عمليات بالتقارير، بس يضيف المشتركين.</li>
+            <li>الاستيراد ما يخصم من المحفظة. تكدر تسجّل اشتراكاتهم <b>دين</b> حتى تنحسب بالديون.</li>
         </ul>
     </div>
     """
@@ -2662,7 +2855,7 @@ def reports():
     totals = money_totals(con, since=start, until=end_full)
     con.close()
 
-    total_cost = sum(a["amount"] or 0 for a in activations)
+    total_cost = sum(a["amount"] or 0 for a in activations if a["operation_type"] != PREV_OP)
     total_charges = sum(c["amount"] for c in charges)
 
     activation_rows = "".join(f"""
