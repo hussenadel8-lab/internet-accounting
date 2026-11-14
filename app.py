@@ -3694,9 +3694,13 @@ def settings():
                         <button class="btn btn-success"><i class="bi bi-send"></i> إرسال نسخة الآن</button></form>
                 </div>
 
+                <div class="alert alert-success small mb-2">
+                    <i class="bi bi-check-circle"></i> <b>النسخة اليومية تلقائية:</b> أول ما تفتح البرنامج كل يوم تتسوى نسخة
+                    وتنبعث للتليكرام بالخلفية — ما تحتاج تسوي شي.
+                </div>
                 <div class="alert alert-light border small mb-0">
-                    <b>حتى تصير يومية تلقائياً (مرة وحدة بس):</b> بـ PythonAnywhere افتح <b>Tasks</b> ←
-                    بقسم <b>Scheduled tasks</b> اختار وقت (مثلاً 23:00) ← والصق هذا الأمر ← <b>Create</b>:
+                    <b>اختياري (للحسابات المدفوعة بـ PythonAnywhere):</b> تكدر تخليها بوقت ثابت من صفحة <b>Tasks</b> ←
+                    <b>Scheduled tasks</b> بهذا الأمر:
                     <div class="d-flex gap-2 mt-2">
                         <input class="form-control form-control-sm" dir="ltr" readonly value="{esc(job_cmd)}" id="jobCmd">
                         <button type="button" class="btn btn-sm btn-outline-secondary"
@@ -3826,6 +3830,31 @@ def run_backup(send_telegram=True):
     con.commit()
     con.close()
     return result
+
+
+def _safe_backup():
+    try:
+        app.logger.info("Daily backup: %s", run_backup())
+    except Exception:
+        app.logger.exception("Daily backup failed")
+
+
+@app.after_request
+def auto_daily_backup(response):
+    """نسخة احتياطية تلقائية مرة باليوم: أول ما يفتح المستخدم البرنامج.
+    تشتغل بعد ما توصل الصفحة للمتصفح حتى ما تبطّئ."""
+    if request.method == "GET" and session.get("user_id") and request.endpoint not in (None, "static", "backup"):
+        try:
+            con = db()
+            today = today_str()
+            if get_setting(con, "auto_backup_day") != today:
+                set_setting(con, "auto_backup_day", today)
+                con.commit()
+                response.call_on_close(_safe_backup)
+            con.close()
+        except Exception:
+            app.logger.exception("auto backup check failed")
+    return response
 
 
 @app.route("/backup")
