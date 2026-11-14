@@ -490,6 +490,12 @@ BASE_HTML = """
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <meta name="theme-color" content="#4f46e5">
     <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="محاسبة الإنترنت">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" type="image/png" href="/static/favicon.png">
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
     <title>محاسبة الإنترنت</title>
     <script>
         // تطبيق الوضع الليلي قبل عرض الصفحة
@@ -847,6 +853,10 @@ BASE_HTML = """
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
+    // تسجيل التطبيق (PWA) حتى ينثبت مثل تطبيق
+    if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+    }
     function toggleTheme() {
         const el = document.documentElement;
         const t = el.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark';
@@ -3873,6 +3883,86 @@ def backup():
         download_name=f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.db",
         mimetype="application/octet-stream"
     )
+
+
+# ---------------------------------------------------------------------------
+# تطبيق الموبايل (PWA): يتثبت على الشاشة ويتحول APK عن طريق PWABuilder
+# ---------------------------------------------------------------------------
+
+@app.route("/manifest.webmanifest")
+def manifest():
+    import json
+    data = {
+        "id": "/",
+        "name": "محاسبة الإنترنت",
+        "short_name": "محاسبة الإنترنت",
+        "description": "إدارة مشتركي الإنترنت: التفعيل والترحيل والديون والمحفظة والتقارير",
+        "lang": "ar",
+        "dir": "rtl",
+        "start_url": "/dashboard",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": "#f4f6fb",
+        "theme_color": "#4f46e5",
+        "categories": ["business", "finance", "productivity"],
+        "icons": [
+            {"src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/static/icons/maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"},
+            {"src": "/static/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+        ],
+        "shortcuts": [
+            {"name": "المشتركون", "url": "/subscribers", "icons": [{"src": "/static/icons/icon-192.png", "sizes": "192x192"}]},
+            {"name": "الديون", "url": "/debts", "icons": [{"src": "/static/icons/icon-192.png", "sizes": "192x192"}]},
+            {"name": "تفعيلات واتساب", "url": "/whatsapp-import", "icons": [{"src": "/static/icons/icon-192.png", "sizes": "192x192"}]},
+        ],
+    }
+    resp = app.response_class(json.dumps(data, ensure_ascii=False), mimetype="application/manifest+json")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+SERVICE_WORKER_JS = """
+// يحفظ صفحة "ماكو إنترنت" والأيقونات، والباقي دائماً من السيرفر (حتى البيانات تبقى محدثة)
+const CACHE = 'acc-v1';
+const OFFLINE = '/offline';
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll([OFFLINE, '/static/icons/icon-192.png'])));
+  self.skipWaiting();
+});
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))));
+  self.clients.claim();
+});
+self.addEventListener('fetch', e => {
+  if (e.request.mode === 'navigate') {
+    e.respondWith(fetch(e.request).catch(() => caches.match(OFFLINE)));
+  }
+});
+"""
+
+
+@app.route("/sw.js")
+def service_worker():
+    resp = app.response_class(SERVICE_WORKER_JS, mimetype="application/javascript")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["Service-Worker-Allowed"] = "/"
+    return resp
+
+
+@app.route("/offline")
+def offline():
+    return """<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>ماكو إنترنت</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Tahoma,sans-serif;
+background:#f4f6fb;color:#0f172a;text-align:center;padding:20px}
+@media (prefers-color-scheme:dark){body{background:#0b1120;color:#e2e8f0}}
+img{width:96px;border-radius:22px}button{margin-top:16px;padding:12px 28px;border:0;border-radius:12px;
+background:#4f46e5;color:#fff;font-size:16px}</style></head><body><div>
+<img src="/static/icons/icon-192.png" alt=""><h2>ماكو اتصال بالإنترنت</h2>
+<p>البرنامج يحتاج إنترنت حتى يجيب بياناتك. تأكد من الاتصال وحاول مرة ثانية.</p>
+<button onclick="location.reload()">إعادة المحاولة</button></div></body></html>"""
 
 
 @app.errorhandler(400)
