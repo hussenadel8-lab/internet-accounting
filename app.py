@@ -11,6 +11,7 @@
 """
 
 import os
+import re
 import secrets
 import sqlite3
 import tempfile
@@ -33,6 +34,7 @@ app = Flask(__name__)
 # مفتاح الجلسات: يُفضَّل ضبطه كمتغير بيئة على السيرفر.
 app.secret_key = os.environ.get("SECRET_KEY") or "change-this-secret-key"
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # أقصى حجم للملف المرفوع
 
 DB_NAME = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "internet_accounting.db"))
 PROFIT = 5000              # الربح الافتراضي للباقات الجديدة
@@ -636,6 +638,8 @@ BASE_HTML = """
             .table td[colspan] { text-align: center; background: transparent; }
             .table td .form-control { max-width: 60%; background-color: var(--card); border-color: var(--line); }
             .filter-bar > .btn { flex: 1 1 40%; }
+            .table td[data-label]:has(.form-select) { flex-direction: column; align-items: stretch; gap: 6px; }
+            .table td .form-select { width: 100%; max-width: none; background-color: var(--card); }
             .table-responsive { overflow: visible; }
         }
 
@@ -661,7 +665,7 @@ BASE_HTML = """
 {% set titles = {
     'dashboard': 'الرئيسية', 'subscribers': 'المشتركون', 'subscriber_detail': 'تفاصيل المشترك',
     'wallet': 'المحفظة', 'plans': 'الباقات والأسعار', 'reports': 'التقارير',
-    'settings': 'الإعدادات', 'debts': 'حساب الديون', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل اشتراك'
+    'settings': 'الإعدادات', 'debts': 'حساب الديون', 'import_users': 'استيراد اليوزرات', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل اشتراك'
 } %}
 {% set ep = request.endpoint %}
 
@@ -671,7 +675,7 @@ BASE_HTML = """
         <div class="brand"><span class="logo"><i class="bi bi-router"></i></span> محاسبة الإنترنت</div>
         <nav class="nav-side">
             <a href="{{ url_for('dashboard') }}" class="{{ 'active' if ep == 'dashboard' }}"><i class="bi bi-grid-1x2"></i> الرئيسية</a>
-            <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer'] }}"><i class="bi bi-people"></i> المشتركون</a>
+            <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer','import_users'] }}"><i class="bi bi-people"></i> المشتركون</a>
             <a href="{{ url_for('debts') }}" class="{{ 'active' if ep == 'debts' }}"><i class="bi bi-journal-text"></i> الديون</a>
             <a href="{{ url_for('wallet') }}" class="{{ 'active' if ep == 'wallet' }}"><i class="bi bi-wallet2"></i> المحفظة</a>
             <a href="{{ url_for('plans') }}" class="{{ 'active' if ep == 'plans' }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
@@ -1266,6 +1270,9 @@ def subscribers():
                 data-bs-toggle="collapse" data-bs-target="#addSub">
             <i class="bi bi-person-plus"></i> إضافة مشترك جديد
         </button>
+        <a href="{url_for('import_users')}" class="btn btn-outline-primary w-100 mt-2 d-flex align-items-center justify-content-center gap-2">
+            <i class="bi bi-file-earmark-arrow-up"></i> استيراد يوزرات من ملف الشركة (PDF)
+        </a>
         <div class="collapse" id="addSub">
         <form method="post" class="row g-3 mt-2">
             {subscriber_form_fields(plans_list)}
@@ -1871,6 +1878,462 @@ def transfer(subscriber_id):
     if request.method == "POST":
         return perform_operation(subscriber_id, "ترحيل")
     return operation_page(subscriber_id, "ترحيل")
+
+
+# ---------------------------------------------------------------------------
+# استيراد اليوزرات من ملف PDF الشركة
+# ---------------------------------------------------------------------------
+
+IMPORT_DIR = os.path.join(os.path.dirname(DB_NAME) or BASE_DIR, "imports_tmp")
+
+# عناوين أعمدة تقرير الشركة (كما تظهر بعد قراءة النص)
+PDF_HEADERS = {
+    "ت": "seq",
+    "نوع الكارت": "card_type",
+    "اسم الحساب": "username",
+    "اسم الخساب": "username",
+    "اسم العميل": "name",
+    "رقم الكارت": "card_no",
+    "المبلغ": "amount",
+    "مدخل البيانات": "entered_by",
+    "التاريخ": "date",
+}
+# مواقع الأعمدة الافتراضية إذا الصفحة ما بيها عناوين
+PDF_DEFAULT_COLS = {"seq": 819, "card_type": 733, "username": 614, "name": 481,
+                    "card_no": 344, "amount": 253, "entered_by": 170, "date": 77}
+
+_ARABIC = re.compile(r"[؀-ۿ]")
+_LTR_RUN = re.compile(r"[A-Za-z0-9@._:/,\-]+")
+
+
+def _pdf_fonts(page):
+    """خريطة كل رمز بالخط إلى الحرف الحقيقي، مع إصلاح حرف (لا/لأ) المدموج."""
+    fonts = {}
+    resources = page.get("/Resources") or {}
+    font_dict = resources.get("/Font") or {}
+    for key, ref in font_dict.items():
+        font = ref.get_object()
+        mapping = {}
+        tu = font.get("/ToUnicode")
+        if tu is not None:
+            cmap = tu.get_object().get_data().decode("latin1")
+            for a, b, u in re.findall(r"<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]*)>", cmap):
+                for code in range(int(a, 16), int(b, 16) + 1):
+                    try:
+                        mapping[code] = chr(int(u, 16)) if u else ""
+                    except ValueError:
+                        mapping[code] = ""
+        # الحروف المدموجة (لا، لأ) تنقرأ "ل" فقط، نميزها من عرض الحرف
+        widths = font.get("/Widths")
+        first = font.get("/FirstChar", 0)
+        if widths is not None:
+            widths = [float(w) for w in widths]
+            for c, ch in mapping.items():
+                if ch == "ل" and 0 <= c - first < len(widths):
+                    w = widths[c - first]
+                    if w >= 520:
+                        # النص بالترتيب البصري (معكوس)، فنكتب الألف قبل اللام
+                        mapping[c] = "أل" if 540 <= w <= 548 else "ال"
+        fonts[key] = mapping
+    return fonts
+
+
+def _visual_to_logical(text):
+    """النص العربي بملف الشركة مخزون بالمقلوب: نعدله ونرجع الأرقام والإنكليزي لاتجاهها."""
+    if not _ARABIC.search(text):
+        return " ".join(text.split())
+    rev = text[::-1]
+    rev = _LTR_RUN.sub(lambda m: m.group(0)[::-1], rev)
+    return " ".join(rev.split())
+
+
+def _pdf_items(page, reader):
+    from pypdf.generic import ContentStream
+    fonts = _pdf_fonts(page)
+    stream = ContentStream(page.get_contents(), reader)
+    font = None
+    x = y = lx = ly = 0.0
+    items = []
+    for operands, op in stream.operations:
+        if op == b"Tf":
+            font = operands[0]
+        elif op == b"Tm":
+            x = lx = float(operands[4])
+            y = ly = float(operands[5])
+        elif op in (b"Td", b"TD"):
+            lx += float(operands[0])
+            ly += float(operands[1])
+            x, y = lx, ly
+        elif op in (b"Tj", b"TJ"):
+            parts = operands[0] if op == b"TJ" else [operands[0]]
+            raw = b"".join(p.get_original_bytes() for p in parts if hasattr(p, "get_original_bytes"))
+            mapping = fonts.get(font, {})
+            text = "".join(mapping.get(c, "") for c in raw)
+            if text.strip():
+                items.append((y, x, text))
+    return items
+
+
+def parse_company_pdf(data):
+    """قراءة تقرير الشركة. ترجع قائمة صفوف: يوزر، اسم، نوع الكارت، المبلغ، التاريخ."""
+    import pypdf
+    reader = pypdf.PdfReader(BytesIO(data))
+    rows = []
+    cols = dict(PDF_DEFAULT_COLS)
+    for page in reader.pages:
+        items = _pdf_items(page, reader)
+        # تجميع العناصر حسب السطر
+        lines = []
+        for y, x, text in sorted(items, key=lambda t: -t[0]):
+            if lines and abs(lines[-1][0] - y) <= 1.5:
+                lines[-1][1].append((x, text))
+            else:
+                lines.append([y, [(x, text)]])
+
+        # مواقع العناوين بهذي الصفحة
+        found = {}
+        for _, parts in lines:
+            for x, text in parts:
+                key = PDF_HEADERS.get(_visual_to_logical(text))
+                if key:
+                    found[key] = x
+        if len(found) >= 5:
+            cols.update(found)
+
+        for _, parts in lines:
+            fields = {}
+            for x, text in sorted(parts, key=lambda p: p[0]):
+                key = min(cols, key=lambda k: abs(cols[k] - x))
+                fields.setdefault(key, []).append(text)
+            date_txt = re.sub(r"/\s+", "/", " ".join(" ".join(fields.get("date", [])).split()))
+            m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", date_txt)
+            if not m:
+                continue
+            day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            try:
+                op_date = date(year, month, day).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+            username = "".join(" ".join(fields.get("username", [])).split())
+            if not username:
+                continue
+            name_parts = [_visual_to_logical(t) for t in fields.get("name", []) + fields.get("card_no", [])
+                          if _ARABIC.search(t)]
+            amount = parse_amount(" ".join(fields.get("amount", [])).replace(" ", "")) or 0
+            rows.append({
+                "username": username,
+                "name": " ".join(name_parts).strip(),
+                "card_type": " ".join(_visual_to_logical(t) for t in fields.get("card_type", [])).strip(),
+                "amount": amount,
+                "entered_by": " ".join(_visual_to_logical(t) for t in fields.get("entered_by", [])).strip(),
+                "date": op_date,
+                "time": date_txt[m.end():].strip(),
+            })
+    return rows
+
+
+PLAN_ALIASES = {
+    "economy": ["إيكو", "ايكو", "economy"],
+    "plus": ["بلص", "بلس", "plus"],
+    "standard": ["استاندر", "ستاندر", "standard"],
+    "active": ["اكتف", "active"],
+    "basic": ["بيسك", "basic"],
+}
+
+
+def guess_plan(card_type, plans_list):
+    """تخمين الباقة المطابقة لنوع الكارت."""
+    ct = card_type.lower().strip()
+    for p in plans_list:
+        if p["name"].lower().strip() == ct:
+            return p["id"]
+    num = re.search(r"\d+", ct)
+    if "fiber" in ct and num:
+        for p in plans_list:
+            if "فايبر" in p["name"] and re.search(rf"\b{num.group(0)}\b", p["name"]):
+                return p["id"]
+    if not ct.endswith("-w"):
+        for key, names in PLAN_ALIASES.items():
+            if ct == key:
+                for p in plans_list:
+                    if p["name"].strip().lower() in names:
+                        return p["id"]
+    return "new"
+
+
+def _import_path(token):
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        return None
+    return os.path.join(IMPORT_DIR, token + ".json")
+
+
+def _cleanup_imports():
+    try:
+        cutoff = datetime.now().timestamp() - 86400
+        for f in os.listdir(IMPORT_DIR):
+            path = os.path.join(IMPORT_DIR, f)
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+    except OSError:
+        pass
+
+
+@app.route("/import", methods=["GET", "POST"])
+@login_required
+def import_users():
+    import json
+
+    if request.method == "POST" and request.form.get("step") == "upload":
+        file = request.files.get("file")
+        if not file or not file.filename:
+            flash("اختار ملف PDF", "danger")
+            return redirect(url_for("import_users"))
+        data = file.read()
+        if not data.startswith(b"%PDF"):
+            flash("الملف مو PDF. نزّل التقرير من لوحة الشركة بصيغة PDF", "danger")
+            return redirect(url_for("import_users"))
+        try:
+            rows = parse_company_pdf(data)
+        except ImportError:
+            flash("مكتبة قراءة PDF غير منصّبة على السيرفر. نفّذ الأمر: pip3 install pypdf", "danger")
+            return redirect(url_for("import_users"))
+        except Exception:
+            app.logger.exception("PDF import failed")
+            flash("ما گدرت أقرأ الملف. تأكد إنه تقرير اليوزرات من لوحة الشركة", "danger")
+            return redirect(url_for("import_users"))
+        if not rows:
+            flash("ما لگيت يوزرات بالملف. تأكد إنه تقرير اليوزرات من لوحة الشركة", "warning")
+            return redirect(url_for("import_users"))
+
+        # إذا اليوزر مكرر بالملف (جدد أكثر من مرة) نأخذ آخر عملية
+        latest = {}
+        for r in rows:
+            key = r["username"].lower()
+            if key not in latest or (r["date"], r["time"]) >= (latest[key]["date"], latest[key]["time"]):
+                if key in latest and not r["name"]:
+                    r["name"] = latest[key]["name"]
+                latest[key] = r
+        rows = sorted(latest.values(), key=lambda r: (r["date"], r["time"]))
+
+        os.makedirs(IMPORT_DIR, exist_ok=True)
+        _cleanup_imports()
+        token = secrets.token_hex(16)
+        with open(_import_path(token), "w", encoding="utf-8") as f:
+            json.dump({"rows": rows, "file": file.filename, "total": len(rows)}, f, ensure_ascii=False)
+        return redirect(url_for("import_users", t=token))
+
+    if request.method == "POST" and request.form.get("step") == "confirm":
+        path = _import_path(request.form.get("token"))
+        if not path or not os.path.exists(path):
+            flash("انتهت صلاحية الاستيراد، ارفع الملف مرة ثانية", "danger")
+            return redirect(url_for("import_users"))
+        with open(path, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+
+        update_existing = request.form.get("update_existing") == "1"
+        profit = parse_amount(request.form.get("profit"))
+        profit = PROFIT if profit is None or profit < 0 else profit
+
+        con = db()
+        con.execute("BEGIN IMMEDIATE")
+        plans_by_type = {}
+        created_plans = 0
+        types = sorted({r["card_type"] for r in rows})
+        for i, ct in enumerate(types):
+            choice = request.form.get(f"plan_{i}", "new")
+            if choice.isdigit() and con.execute("SELECT 1 FROM plans WHERE id = ?", (int(choice),)).fetchone():
+                plans_by_type[ct] = int(choice)
+            else:
+                same = [r for r in rows if r["card_type"] == ct]
+                wholesale = max(same, key=lambda r: (r["date"], r["time"]))["amount"]
+                category = "فايبر" if "fiber" in ct.lower() else "وايرليس"
+                cur = con.execute("""
+                    INSERT INTO plans (category, name, retail_price, profit, wholesale_price)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (category, ct or "غير معروف", wholesale + profit, profit, wholesale))
+                plans_by_type[ct] = cur.lastrowid
+                created_plans += 1
+
+        added = updated = skipped = 0
+        now = now_str()
+        for i, r in enumerate(rows):
+            if request.form.get(f"use_{i}") != "1":
+                continue
+            name = (request.form.get(f"name_{i}") or "").strip() or r["name"] or r["username"]
+            plan_id = plans_by_type[r["card_type"]]
+            start = r["date"]
+            expiry = expiry_from(start)
+            existing = con.execute(
+                "SELECT * FROM subscribers WHERE lower(username) = lower(?)", (r["username"],)
+            ).fetchone()
+            if existing:
+                if not update_existing or (existing["activation_date"] or "") > start:
+                    skipped += 1
+                    continue
+                con.execute("""
+                    UPDATE subscribers SET plan_id = ?, activation_date = ?, expiry_date = ?,
+                           name = CASE WHEN name = '' OR name = username THEN ? ELSE name END
+                    WHERE id = ?
+                """, (plan_id, start, expiry, name, existing["id"]))
+                updated += 1
+            else:
+                con.execute("""
+                    INSERT INTO subscribers
+                    (name, username, phone, plan_id, activation_date, expiry_date, notes, created_at)
+                    VALUES (?, ?, '', ?, ?, ?, ?, ?)
+                """, (name, r["username"], plan_id, start, expiry, "", now))
+                added += 1
+        con.commit()
+        con.close()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+        msg = f"تم الاستيراد: {added} مشترك جديد"
+        if updated:
+            msg += f"، تحديث {updated}"
+        if skipped:
+            msg += f"، تخطي {skipped}"
+        if created_plans:
+            msg += f" — وأُضيفت {created_plans} باقة جديدة (راجع أسعارها من صفحة الباقات)"
+        flash(msg, "success")
+        return redirect(url_for("subscribers"))
+
+    # --- عرض المعاينة ---
+    token = request.args.get("t")
+    path = _import_path(token) if token else None
+    if path and os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        rows = payload["rows"]
+        con = db()
+        plans_list = con.execute("SELECT * FROM plans ORDER BY category, id").fetchall()
+        existing = {r["u"]: r["activation_date"] for r in con.execute(
+            "SELECT lower(username) AS u, activation_date FROM subscribers")}
+        con.close()
+
+        types = sorted({r["card_type"] for r in rows})
+        type_rows = ""
+        for i, ct in enumerate(types):
+            same = [r for r in rows if r["card_type"] == ct]
+            amounts = sorted({r["amount"] for r in same})
+            guess = guess_plan(ct, plans_list)
+            opts = f'<option value="new" {"selected" if guess == "new" else ""}>➕ باقة جديدة باسم "{esc(ct)}"</option>'
+            opts += "".join(
+                f'<option value="{p["id"]}" {"selected" if guess == p["id"] else ""}>'
+                f'{esc(p["category"])} - {esc(p["name"])} (جملة {money(p["wholesale_price"])})</option>'
+                for p in plans_list)
+            type_rows += f"""
+            <tr>
+                <td><b dir="ltr">{esc(ct) or '—'}</b></td>
+                <td>{len(same)}</td>
+                <td>{" / ".join(money(a) for a in amounts)}</td>
+                <td><select name="plan_{i}" class="form-select form-select-sm">{opts}</select></td>
+            </tr>"""
+
+        new_count = sum(1 for r in rows if r["username"].lower() not in existing)
+        exist_count = len(rows) - new_count
+        user_rows = ""
+        for i, r in enumerate(rows):
+            is_existing = r["username"].lower() in existing
+            badge = ('<span class="badge bg-warning text-dark">موجود</span>' if is_existing
+                     else '<span class="badge bg-success">جديد</span>')
+            user_rows += f"""
+            <tr>
+                <td><input type="checkbox" name="use_{i}" value="1" class="form-check-input row-check" checked></td>
+                <td><input name="name_{i}" value="{esc(r['name'])}" class="form-control form-control-sm" placeholder="{esc(r['username'])}"></td>
+                <td dir="ltr">{esc(r['username'])}</td>
+                <td dir="ltr">{esc(r['card_type'])}</td>
+                <td>{money(r['amount'])}</td>
+                <td>{esc(r['date'])}</td>
+                <td>{badge}</td>
+            </tr>"""
+
+        body = f"""
+        <h2 class="mb-4">استيراد اليوزرات</h2>
+        <form method="post">
+            <input type="hidden" name="step" value="confirm">
+            <input type="hidden" name="token" value="{esc(token)}">
+
+            <div class="row g-3 mb-4">
+                <div class="col-4"><div class="card stat-card p-3"><h6>يوزرات بالملف</h6><h3>{len(rows)}</h3></div></div>
+                <div class="col-4"><div class="card stat-card p-3"><h6>جديد</h6><h3 class="text-success">{new_count}</h3></div></div>
+                <div class="col-4"><div class="card stat-card p-3"><h6>موجود سابقاً</h6><h3 class="text-warning">{exist_count}</h3></div></div>
+            </div>
+
+            <div class="card p-4 mb-4">
+                <h5><i class="bi bi-box-seam text-primary"></i> ربط نوع الكارت بالباقة</h5>
+                <p class="text-muted small">لكل نوع كارت اختار الباقة المقابلة ببرنامجك، أو خليه "باقة جديدة" وتنضاف تلقائياً:
+                سعر الجملة = آخر مبلغ بالملف، وسعر البيع = الجملة + الربح.</p>
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead><tr><th>نوع الكارت</th><th>العدد</th><th>المبلغ بالملف</th><th>الباقة ببرنامجك</th></tr></thead>
+                        <tbody>{type_rows}</tbody>
+                    </table>
+                </div>
+                <div class="row g-3 mt-1">
+                    <div class="col-md-4">
+                        <label class="form-label">الربح للباقات الجديدة</label>
+                        <input type="number" name="profit" min="0" value="{PROFIT}" class="form-control">
+                    </div>
+                    <div class="col-md-8 d-flex align-items-end">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" name="update_existing" value="1" id="upd" checked>
+                            <label class="form-check-label" for="upd">
+                                اليوزرات الموجودة: حدّث الباقة وتاريخ التفعيل والانتهاء (إذا تاريخ الملف أحدث)
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card p-4 mb-4">
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+                    <h5 class="mb-0"><i class="bi bi-people text-primary"></i> اليوزرات</h5>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="allChk" checked
+                               onchange="document.querySelectorAll('.row-check').forEach(c => c.checked = this.checked)">
+                        <label class="form-check-label" for="allChk">تحديد الكل</label>
+                    </div>
+                </div>
+                <p class="text-muted small">تكدر تعدّل أي اسم قبل الحفظ. إذا الاسم فارغ ينحفظ باسم اليوزر.
+                تاريخ الانتهاء = تاريخ العملية + {SUBSCRIPTION_DAYS} يوم. أرقام الهواتف ضيفها بعدين من التعديل.</p>
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead><tr><th></th><th>الاسم</th><th>اليوزر</th><th>نوع الكارت</th><th>المبلغ</th><th>التاريخ</th><th>الحالة</th></tr></thead>
+                        <tbody>{user_rows}</tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="d-flex gap-2 import-actions">
+                <button class="btn btn-success flex-fill py-3"><i class="bi bi-cloud-arrow-down"></i> استيراد اليوزرات المحددة</button>
+                <a href="{url_for('import_users')}" class="btn btn-outline-secondary py-3">إلغاء</a>
+            </div>
+        </form>
+        """
+        return page(body)
+
+    body = f"""
+    <h2 class="mb-4">استيراد اليوزرات</h2>
+    <div class="card p-4" style="max-width:640px">
+        <h5><i class="bi bi-file-earmark-pdf text-danger"></i> رفع تقرير اليوزرات من لوحة الشركة</h5>
+        <p class="text-muted">ارفع ملف PDF الي تنزله من لوحة الشركة (تقرير الكارتات). البرنامج يقرأ
+        اليوزر واسم العميل ونوع الكارت والمبلغ والتاريخ، ويعرضلك معاينة قبل الحفظ.</p>
+        <form method="post" enctype="multipart/form-data">
+            <input type="hidden" name="step" value="upload">
+            <input type="file" name="file" accept="application/pdf,.pdf" class="form-control mb-3" required>
+            <button class="btn btn-primary w-100 py-3"><i class="bi bi-upload"></i> قراءة الملف</button>
+        </form>
+        <ul class="text-muted small mt-3 mb-0">
+            <li>ما ينضاف شي قبل ما تأكد بالمعاينة.</li>
+            <li>اليوزر المكرر بالملف ينحسب مرة وحدة بآخر تاريخ.</li>
+            <li>الاستيراد ما يخصم من المحفظة وما يسجل عمليات بالتقارير، بس يضيف المشتركين.</li>
+        </ul>
+    </div>
+    """
+    return page(body)
 
 
 # ---------------------------------------------------------------------------

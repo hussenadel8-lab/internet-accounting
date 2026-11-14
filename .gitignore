@@ -2,3 +2,4 @@ internet_accounting.db
 *.db-journal
 __pycache__/
 .venv/
+imports_tmp/
