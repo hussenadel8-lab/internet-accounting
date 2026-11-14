@@ -3519,6 +3519,50 @@ def settings():
                       + (" والباقات رجعت للأسعار الجديدة" if request.form.get("reset_plans") == "1" else "")
                       + f" — انحفظت نسخة احتياطية بالسيرفر: backups/{os.path.basename(bpath)}", "success")
 
+        elif action == "tg_token":
+            token = form_text("tg_token").replace(" ", "")
+            if not token:
+                for k in ("tg_token", "tg_chat", "tg_bot"):
+                    con.execute("DELETE FROM settings WHERE key = ?", (k,))
+                con.commit()
+                flash("تم فصل التليكرام", "success")
+            else:
+                ok, res = telegram_api(token, "getMe")
+                if ok:
+                    set_setting(con, "tg_token", token)
+                    set_setting(con, "tg_bot", res.get("username", ""))
+                    con.commit()
+                    flash(f"تم حفظ البوت @{res.get('username', '')} ✅ — هسه افتحه بالتليكرام واضغط Start، وبعدها اضغط (ربط المحادثة)", "success")
+                else:
+                    flash(f"التوكن غير صحيح: {res}", "danger")
+
+        elif action == "tg_link":
+            token = get_setting(con, "tg_token")
+            ok, res = telegram_api(token, "getUpdates") if token else (False, "احفظ توكن البوت أول")
+            chat = None
+            if ok:
+                for upd in reversed(res):
+                    msg = upd.get("message") or upd.get("edited_message") or {}
+                    if msg.get("chat", {}).get("id"):
+                        chat = msg["chat"]
+                        break
+            if chat:
+                set_setting(con, "tg_chat", str(chat["id"]))
+                con.commit()
+                telegram_api(token, "sendMessage", {"chat_id": chat["id"],
+                             "text": "✅ تم ربط برنامج محاسبة الإنترنت. راح توصلك النسخ الاحتياطية هنا."})
+                flash(f"تم ربط المحادثة ({chat.get('first_name') or chat.get('title') or chat['id']}) ✅ — وصلتك رسالة بالتليكرام", "success")
+            elif ok:
+                flash("ما لگيت رسالة — افتح البوت بالتليكرام واضغط Start (أو ابعثله أي رسالة) وبعدها اضغط ربط مرة ثانية", "warning")
+            else:
+                flash(f"ما گدرت أربط: {res}", "danger")
+
+        elif action == "tg_send":
+            con.close()
+            result = run_backup()
+            flash(result, "success" if "✅" in result else "warning")
+            return redirect(url_for("settings"))
+
         elif action == "add_user":
             username = form_text("username")
             password = request.form.get("password", "")
@@ -3547,7 +3591,12 @@ def settings():
     users = con.execute("SELECT id, username FROM users ORDER BY id").fetchall()
     shop = get_setting(con, "shop_name")
     qp = get_setting(con, "quick_prices", "")
+    tg_token = get_setting(con, "tg_token")
+    tg_chat = get_setting(con, "tg_chat")
+    tg_bot = get_setting(con, "tg_bot")
+    last_backup = get_setting(con, "last_backup")
     con.close()
+    job_cmd = f"python3 {os.path.join(BASE_DIR, 'backup_job.py')}"
 
     user_rows = "".join(f"""
         <tr>
@@ -3616,6 +3665,49 @@ def settings():
         </div>
 
         <div class="col-12">
+            <div class="card p-4">
+                <h5><i class="bi bi-telegram" style="color:#229ED9"></i> النسخ الاحتياطي التلقائي على التليكرام</h5>
+                <div class="mb-3">
+                    {'<span class="badge bg-success">مربوط ✅</span> البوت @' + esc(tg_bot) if tg_token and tg_chat else
+                     ('<span class="badge bg-warning text-dark">البوت محفوظ — باقي ربط المحادثة</span>' if tg_token else
+                      '<span class="badge bg-secondary">مو مربوط</span>')}
+                    <div class="small text-muted mt-1">آخر نسخة: {esc(last_backup) or 'ماكو بعد'}</div>
+                </div>
+
+                <ol class="small text-muted mb-3">
+                    <li>بالتليكرام ابحث عن <b dir="ltr">@BotFather</b> ← اضغط Start ← اكتب <b dir="ltr">/newbot</b> ← اختار اسم للبوت ← ينطيك <b>توكن</b> (رقم طويل).</li>
+                    <li>الصق التوكن هنا واضغط حفظ.</li>
+                    <li>افتح البوت الجديد بالتليكرام واضغط <b>Start</b>، وارجع اضغط <b>ربط المحادثة</b>.</li>
+                    <li>اضغط <b>إرسال نسخة الآن</b> للتجربة.</li>
+                </ol>
+
+                <form method="post" class="row g-2 mb-2">
+                    <input type="hidden" name="action" value="tg_token">
+                    <div class="col-md-8"><input name="tg_token" class="form-control" dir="ltr" autocomplete="off"
+                        placeholder="{'••••••••' + esc(tg_token[-4:]) + ' (محفوظ — اتركه فارغ واضغط حفظ للفصل)' if tg_token else '123456789:ABC...'}"></div>
+                    <div class="col-md-4"><button class="btn btn-primary w-100">حفظ التوكن</button></div>
+                </form>
+                <div class="d-flex flex-wrap gap-2 mb-3">
+                    <form method="post"><input type="hidden" name="action" value="tg_link">
+                        <button class="btn btn-outline-primary" {'disabled' if not tg_token else ''}><i class="bi bi-link-45deg"></i> ربط المحادثة</button></form>
+                    <form method="post"><input type="hidden" name="action" value="tg_send">
+                        <button class="btn btn-success"><i class="bi bi-send"></i> إرسال نسخة الآن</button></form>
+                </div>
+
+                <div class="alert alert-light border small mb-0">
+                    <b>حتى تصير يومية تلقائياً (مرة وحدة بس):</b> بـ PythonAnywhere افتح <b>Tasks</b> ←
+                    بقسم <b>Scheduled tasks</b> اختار وقت (مثلاً 23:00) ← والصق هذا الأمر ← <b>Create</b>:
+                    <div class="d-flex gap-2 mt-2">
+                        <input class="form-control form-control-sm" dir="ltr" readonly value="{esc(job_cmd)}" id="jobCmd">
+                        <button type="button" class="btn btn-sm btn-outline-secondary"
+                                onclick="navigator.clipboard.writeText(document.getElementById('jobCmd').value);this.textContent='تم النسخ'">نسخ</button>
+                    </div>
+                    <div class="mt-2">الوقت بـ PythonAnywhere بتوقيت UTC (بغداد = UTC + 3)، يعني 20:00 هناك = 11 بالليل عندك.</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-12">
             <div class="card p-4 border-danger" style="border-width:2px">
                 <h5 class="text-danger"><i class="bi bi-exclamation-octagon"></i> تصفير البرنامج</h5>
                 <p class="text-muted mb-3">يمسح <b>كل المشتركين والعمليات والديون وحركات المحفظة</b> حتى تبدي من جديد.
@@ -3638,17 +3730,111 @@ def settings():
     return page(body)
 
 
+# ---------------------------------------------------------------------------
+# النسخ الاحتياطي التلقائي + الإرسال للتليكرام
+# ---------------------------------------------------------------------------
+
+BACKUP_DIR = os.path.join(os.path.dirname(DB_NAME) or BASE_DIR, "backups")
+BACKUP_KEEP_DAYS = 30
+
+
+def make_backup_file(path):
+    """نسخة كاملة وآمنة من قاعدة البيانات (تشتغل حتى والبرنامج مفتوح)."""
+    src = db()
+    dst = sqlite3.connect(path)
+    src.backup(dst)
+    dst.close()
+    src.close()
+
+
+def telegram_api(token, method, fields=None, file_path=None, file_name=None):
+    """طلب لـ Telegram Bot API. يرجع (نجح؟، النتيجة أو رسالة الخطأ)."""
+    import json
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    fields = {k: str(v) for k, v in (fields or {}).items()}
+    if file_path:
+        boundary = "----accounting" + secrets.token_hex(8)
+        body = BytesIO()
+        for k, v in fields.items():
+            body.write(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+        body.write(f'--{boundary}\r\nContent-Disposition: form-data; name="document"; '
+                   f'filename="{file_name or os.path.basename(file_path)}"\r\n'
+                   f'Content-Type: application/octet-stream\r\n\r\n'.encode())
+        with open(file_path, "rb") as f:
+            body.write(f.read())
+        body.write(f"\r\n--{boundary}--\r\n".encode())
+        req = urllib.request.Request(url, data=body.getvalue(),
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    else:
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            data = json.loads(e.read().decode())
+        except Exception:
+            return False, f"خطأ من تليكرام ({e.code})"
+    except Exception as e:
+        return False, f"ما گدر يتصل بتليكرام: {e}"
+    if not data.get("ok"):
+        return False, data.get("description", "خطأ غير معروف")
+    return True, data.get("result")
+
+
+def backup_summary(con):
+    subs = con.execute("SELECT COUNT(*) AS c FROM subscribers").fetchone()["c"]
+    totals = money_totals(con)
+    return (f"💾 نسخة احتياطية — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            f"👥 المشتركين: {subs}\n"
+            f"💰 رصيد المحفظة: {money(wallet_balance(con))} د.ع\n"
+            f"📒 الديون: {money(totals['debt'])} د.ع على {totals['debt_n']} مشترك\n"
+            f"📈 الأرباح الكلية: {money(totals['profit'])} د.ع")
+
+
+def run_backup(send_telegram=True):
+    """يسوي نسخة يومية بمجلد backups ويحذف القديمة، ويبعثها للتليكرام إذا مربوط.
+    يرجع رسالة بالنتيجة."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    path = os.path.join(BACKUP_DIR, f"daily_{stamp}.db")
+    make_backup_file(path)
+
+    # الاحتفاظ بآخر 30 نسخة يومية فقط
+    daily = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("daily_") and f.endswith(".db"))
+    for old in daily[:-BACKUP_KEEP_DAYS]:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, old))
+        except OSError:
+            pass
+
+    result = f"انحفظت النسخة: backups/{os.path.basename(path)}"
+    con = db()
+    token = get_setting(con, "tg_token")
+    chat = get_setting(con, "tg_chat")
+    if send_telegram and token and chat:
+        caption = backup_summary(con)
+        ok, res = telegram_api(token, "sendDocument", {"chat_id": chat, "caption": caption},
+                               file_path=path, file_name=f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.db")
+        result += " — وانبعثت للتليكرام ✅" if ok else f" — ⚠️ ما انبعثت للتليكرام: {res}"
+    elif send_telegram:
+        result += " — (التليكرام مو مربوط)"
+    set_setting(con, "last_backup", f"{now_str()} — {result}")
+    con.commit()
+    con.close()
+    return result
+
+
 @app.route("/backup")
 @login_required
 def backup():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
-        src = db()
-        dst = sqlite3.connect(path)
-        src.backup(dst)
-        dst.close()
-        src.close()
+        make_backup_file(path)
         with open(path, "rb") as f:
             data = BytesIO(f.read())
     finally:
