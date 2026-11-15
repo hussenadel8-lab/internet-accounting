@@ -246,6 +246,10 @@ def init_db():
     if not column_exists(cur, "plans", "self_price"):
         cur.execute("ALTER TABLE plans ADD COLUMN self_price INTEGER")
 
+    # ملاحظات خاصة بحساب الدفع من قبلي لكل مشترك
+    if not column_exists(cur, "subscribers", "self_notes"):
+        cur.execute("ALTER TABLE subscribers ADD COLUMN self_notes TEXT")
+
     # نوع المستخدم: admin = البرنامج الرئيسي، self = حساب الدفع من قبلي بس
     if not column_exists(cur, "users", "role"):
         cur.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
@@ -530,7 +534,7 @@ ROLE_ADMIN, ROLE_SELF = "admin", "self"
 # صفحات حساب الدفع من قبلي (تفتح بس بيوزر هذا الحساب)
 SHARED_ENDPOINTS = {"import_users"}  # تفتح للحسابين (كل واحد بطريقته)
 SELF_ENDPOINTS = {"self_account", "self_collect", "self_old_add", "self_old_delete", "self_report",
-                  "self_wallet_move", "self_uncollect", "self_bulk_old"}
+                  "self_wallet_move", "self_uncollect", "self_bulk_old", "self_edit"}
 PUBLIC_ENDPOINTS = {"login", "logout", "static", "manifest", "service_worker", "offline"}
 
 
@@ -2534,7 +2538,7 @@ def self_account_totals(con, since=None):
 def self_account():
     con = db()
     ops = con.execute("""
-        SELECT a.*, s.name, s.username, s.phone, s.expiry_date, p.name AS plan_name
+        SELECT a.*, s.name, s.username, s.phone, s.self_notes, s.expiry_date, p.name AS plan_name
         FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
         WHERE a.payment_type = 'من قبلي'
         ORDER BY a.operation_date
@@ -2546,7 +2550,7 @@ def self_account():
     sw_balance = self_wallet_balance(con)
     sw_moves = con.execute("SELECT * FROM self_wallet ORDER BY id DESC LIMIT 100").fetchall()
     olds = con.execute("""
-        SELECT o.*, s.name, s.username, s.phone, s.id AS subscriber_id FROM self_old o
+        SELECT o.*, s.name, s.username, s.phone, s.self_notes, s.id AS subscriber_id FROM self_old o
         JOIN subscribers s ON s.id = o.subscriber_id ORDER BY o.id
     """).fetchall()
     all_subs = con.execute("SELECT id, name, username FROM subscribers ORDER BY name").fetchall()
@@ -2601,7 +2605,7 @@ def self_account():
             for x in d["old"])
         return f"""
         <tr>
-            <td class="fw-bold">{esc(o['name'])}</td>
+            <td>{self_name_cell(o)}</td>
             <td dir="ltr">{esc(o['username'])}</td>
             <td>{f'<span class="badge {"bg-danger" if months > 1 else "bg-warning text-dark"}">{months} اشتراك</span>' if months else ''}
                 <div class="small text-muted">{esc(dates)}</div>{old_html}</td>
@@ -2622,7 +2626,7 @@ def self_account():
     owing_rows = "".join(owing_row(d) for d in owing)
     settled_rows = "".join(f"""
         <tr>
-            <td>{esc(d['o']['name'])}</td>
+            <td>{self_name_cell(d['o'], bold=False)}</td>
             <td dir="ltr">{esc(d['o']['username'])}</td>
             <td><span class="badge bg-success">مسدد ✓</span></td>
             <td>{d['paid']}</td>
@@ -2743,6 +2747,41 @@ def self_account():
     </div>
     """
     return page(body)
+
+
+def self_name_cell(o, bold=True):
+    """اسم المشترك + ملاحظاته + زر تعديل (الاسم، الهاتف، الملاحظات) بحساب الدفع من قبلي."""
+    sid = o["subscriber_id"]
+    notes = o["self_notes"] if "self_notes" in o.keys() else ""
+    return f"""
+        <div class="{'fw-bold' if bold else ''}">{esc(o['name'])}</div>
+        {f'<div class="small text-muted"><i class="bi bi-sticky"></i> {esc(notes)}</div>' if notes else ''}
+        <details class="mt-1"><summary class="small text-primary" style="cursor:pointer">✏️ تعديل</summary>
+            <form method="post" action="{url_for('self_edit')}" class="mt-2 d-grid gap-1" style="min-width:200px">
+                <input type="hidden" name="subscriber_id" value="{sid}">
+                <input name="name" value="{esc(o['name'])}" class="form-control form-control-sm" placeholder="الاسم" required>
+                <input name="phone" value="{esc(o['phone'])}" class="form-control form-control-sm" placeholder="رقم الهاتف" dir="ltr" inputmode="tel">
+                <textarea name="self_notes" class="form-control form-control-sm" rows="2" placeholder="ملاحظات">{esc(notes)}</textarea>
+                <button class="btn btn-sm btn-primary">حفظ</button>
+            </form>
+        </details>"""
+
+
+@app.route("/self-account/edit", methods=["POST"])
+@login_required
+def self_edit():
+    sid = request.form.get("subscriber_id", "")
+    name = form_text("name")
+    if not sid.isdigit() or not name:
+        flash("الاسم مطلوب", "danger")
+        return redirect(url_for("self_account"))
+    con = db()
+    cur = con.execute("UPDATE subscribers SET name = ?, phone = ?, self_notes = ? WHERE id = ?",
+                      (name, form_text("phone"), form_text("self_notes"), int(sid)))
+    con.commit()
+    con.close()
+    flash("تم حفظ التعديل ✅" if cur.rowcount else "المشترك غير موجود", "success" if cur.rowcount else "danger")
+    return redirect(url_for("self_account"))
 
 
 @app.route("/self-account/wallet", methods=["POST"])
