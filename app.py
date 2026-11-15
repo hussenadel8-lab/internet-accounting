@@ -842,7 +842,7 @@ BASE_HTML = """
 {% set titles = {
     'dashboard': 'الرئيسية', 'subscribers': 'المشتركون', 'subscriber_detail': 'تفاصيل المشترك',
     'wallet': 'المحفظة', 'plans': 'الباقات والأسعار', 'reports': 'التقارير',
-    'settings': 'الإعدادات', 'debts': 'الديون', 'self_account': 'الدفع من قبلي', 'settle_operation': 'ترحيل', 'import_users': 'استيراد اليوزرات', 'wa_import': 'تفعيلات واتساب', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل'
+    'settings': 'الإعدادات', 'debts': 'الديون', 'collection': 'تحصيل المبالغ', 'self_account': 'الدفع من قبلي', 'settle_operation': 'ترحيل', 'import_users': 'استيراد اليوزرات', 'wa_import': 'تفعيلات واتساب', 'activate': 'تفعيل اشتراك', 'transfer': 'ترحيل'
 } %}
 {% set ep = request.endpoint %}
 
@@ -1174,17 +1174,15 @@ def dashboard():
             </div>
         </div>""",
         stat_card("تحصيل المبالغ", f"{money(since['collected'])} د.ع", "bi-cash-stack", "#4f46e5",
-                  f"منذ آخر شحن ({esc((last_charge or 'البداية')[:16])}) — نقد {money(since['cash'])} + من قبلي {money(since['self'])}",
-                  url_for("wallet")),
+                  f"منذ آخر شحن ({esc((last_charge or 'البداية')[:16])}) — نقد {money(since['cash'])} + من قبلي {money(since['self'])} — اضغط للتفاصيل",
+                  url_for("collection")),
         stat_card("الأرباح هذا الشهر", f"{money(month['profit'])} د.ع", "bi-graph-up-arrow", "#10b981",
                   f"من النقد فقط — الإجمالي: {money(total['profit'])} د.ع"),
-        stat_card("مجموع مبالغ الاشتراكات", f"{money(month['collected'])} د.ع", "bi-collection", "#7c3aed",
-                  f"هذا الشهر — الإجمالي: {money(total['collected'])}"),
         stat_card("يوزرات الدفع من قبلي", f"{money(selfacc['unpaid'])} د.ع", "bi-piggy-bank", "#0ea5e9",
                   f"بذمتهم إلك ({selfacc['unpaid_subs']} مشترك) — رصيد الحساب {money(sw_bal)} — ربح الشهر {money(selfacc_m['profit'])}",
                   url_for("self_account")),
         stat_card("الديون", f"{money(total['debt'])} د.ع", "bi-journal-text", "#ef4444",
-                  f"على {total['debt_n']} مشترك", url_for("debts")),
+                  f"على {total['debt_n']} مشترك", url_for("debts"), cls="col-12 col-md-4"),
     ])
 
     body = f"""
@@ -1219,6 +1217,95 @@ def dashboard():
 # ---------------------------------------------------------------------------
 # المحفظة
 # ---------------------------------------------------------------------------
+
+@app.route("/collection")
+@login_required
+def collection():
+    """تفاصيل تحصيل المبالغ: اليوزرات الي استلمت منهم من آخر شحن (يتصفر مع كل شحن)."""
+    con = db()
+    since, last = collection_since_charge(con)
+    cond, params = "", []
+    if last:
+        cond, params = "AND a.settled_at >= ?", [last]
+    rows = con.execute(f"""
+        SELECT a.*, s.name, s.username, p.name AS plan_name
+        FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
+        WHERE a.payment_type IN ('نقد', 'من قبلي') AND a.settled_at IS NOT NULL {cond}
+        ORDER BY a.settled_at DESC
+    """, params).fetchall()
+    charges = con.execute("""
+        SELECT amount, notes, created_at FROM wallet_transactions
+        WHERE transaction_type = 'شحن' ORDER BY id DESC LIMIT 20
+    """).fetchall()
+    balance = wallet_balance(con)
+    con.close()
+
+    table = "".join(f"""
+        <tr>
+            <td><a href="{url_for('subscriber_detail', subscriber_id=r['subscriber_id'])}" class="fw-bold text-decoration-none">{esc(r['name'])}</a></td>
+            <td dir="ltr">{esc(r['username'])}</td>
+            <td>{esc(r['plan_name'])}</td>
+            <td class="fw-bold">{money(r['retail_price'])} د.ع</td>
+            <td>{payment_badge(r['payment_type'])}</td>
+            <td class="text-success">{money(r['profit']) if r['payment_type'] == PAY_CASH else '—'}</td>
+            <td>{esc((r['settled_at'] or '')[:16])}</td>
+        </tr>""" for r in rows)
+
+    def before(note):
+        m = re.search(r"التحصيل قبل الشحن: ([\d,]+)", note or "")
+        return m.group(1) if m else "—"
+    charge_rows = "".join(f"""
+        <tr>
+            <td>{esc(c['created_at'][:16])}</td>
+            <td class="text-success fw-bold">+{money(c['amount'])}</td>
+            <td>{before(c['notes'])}</td>
+        </tr>""" for c in charges)
+
+    body = f"""
+    <h2 class="mb-4">تحصيل المبالغ</h2>
+
+    <div class="row g-3 mb-4">
+        <div class="col-12 col-md-4">
+            <div class="card stat-card p-4" style="background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;border:0">
+                <span class="stat-icon" style="background:rgba(255,255,255,.18);color:#fff"><i class="bi bi-cash-stack"></i></span>
+                <h6 style="color:rgba(255,255,255,.85)">المحصّل منذ آخر شحن</h6>
+                <h2>{money(since['collected'])} د.ع</h2>
+                <small style="color:rgba(255,255,255,.85)">آخر شحن: {esc((last or 'ماكو')[:16])} — {len(rows)} يوزر</small>
+            </div>
+        </div>
+        <div class="col-6 col-md-4"><div class="card stat-card p-4"><h6>نقد</h6>
+            <h3 class="text-success">{money(since['cash'])} د.ع</h3><small class="text-muted">ربح {money(since['profit'])} د.ع</small></div></div>
+        <div class="col-6 col-md-4"><div class="card stat-card p-4"><h6>من قبلي</h6>
+            <h3 class="text-info">{money(since['self'])} د.ع</h3><small class="text-muted">بدون ربح هنا</small></div></div>
+    </div>
+
+    <div class="alert alert-info small d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <span>هذا المبلغ تتصفر تلقائياً لما تشحن المحفظة. رصيد المحفظة الحالي: <b>{money(balance)} د.ع</b></span>
+        <a href="{url_for('wallet')}" class="btn btn-sm btn-primary">شحن المحفظة</a>
+    </div>
+
+    <div class="card p-4 mb-4">
+        <h5><i class="bi bi-people text-primary"></i> اليوزرات الي استلمت منهم ({len(rows)})</h5>
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead><tr><th>الاسم</th><th>اليوزر</th><th>الباقة</th><th>المبلغ</th><th>الدفع</th><th>الربح</th><th>وقت الاستلام</th></tr></thead>
+                <tbody>{table or '<tr><td colspan="7" class="text-muted text-center">ما استلمت من أحد من آخر شحن</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card p-4">
+        <h5><i class="bi bi-clock-history text-secondary"></i> الشحنات السابقة</h5>
+        <div class="table-responsive">
+            <table class="table table-striped">
+                <thead><tr><th>وقت الشحن</th><th>مبلغ الشحن</th><th>التحصيل قبل الشحن</th></tr></thead>
+                <tbody>{charge_rows or '<tr><td colspan="3" class="text-muted text-center">ماكو شحنات</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+    """
+    return page(body)
+
 
 @app.route("/wallet", methods=["GET", "POST"])
 @login_required
@@ -1281,7 +1368,7 @@ def wallet():
     <div class="card p-4 mb-4">
         <h4>الرصيد الحالي: <span class="text-success">{money(balance)} د.ع</span></h4>
         <div class="alert mt-2 mb-0" style="background:var(--primary-soft)">
-            <i class="bi bi-cash-stack"></i> تحصيل المبالغ منذ آخر شحن ({esc((last_charge or 'البداية')[:16])}):
+            <i class="bi bi-cash-stack"></i> <a href="{url_for('collection')}" class="alert-link">تحصيل المبالغ</a> منذ آخر شحن ({esc((last_charge or 'البداية')[:16])}):
             <b>{money(since['collected'])} د.ع</b>
             <small class="text-muted">(نقد {money(since['cash'])} + من قبلي {money(since['self'])})</small>
             — يتصفر تلقائياً لما تشحن.
