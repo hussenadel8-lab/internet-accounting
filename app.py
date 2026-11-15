@@ -246,6 +246,10 @@ def init_db():
     if not column_exists(cur, "plans", "self_price"):
         cur.execute("ALTER TABLE plans ADD COLUMN self_price INTEGER")
 
+    # نوع المستخدم: admin = البرنامج الرئيسي، self = حساب الدفع من قبلي بس
+    if not column_exists(cur, "users", "role"):
+        cur.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
+
     # المبالغ السابقة تنخصم من محفظة حساب الدفع من قبلي (مربوطة بـ old_id)
     if not column_exists(cur, "self_wallet", "old_id"):
         cur.execute("ALTER TABLE self_wallet ADD COLUMN old_id INTEGER")
@@ -520,6 +524,32 @@ def csrf_token():
 
 
 app.jinja_env.globals["csrf_token"] = csrf_token
+
+
+ROLE_ADMIN, ROLE_SELF = "admin", "self"
+# صفحات حساب الدفع من قبلي (تفتح بس بيوزر هذا الحساب)
+SELF_ENDPOINTS = {"self_account", "self_collect", "self_old_add", "self_old_delete",
+                  "self_wallet_move", "self_uncollect"}
+PUBLIC_ENDPOINTS = {"login", "logout", "static", "manifest", "service_worker", "offline"}
+
+
+def home_url():
+    return url_for("self_account") if session.get("role") == ROLE_SELF else url_for("dashboard")
+
+
+@app.before_request
+def role_access():
+    """كل يوزر يشوف حسابه بس: الرئيسي ما يفتح حساب الدفع من قبلي، وبالعكس."""
+    ep = request.endpoint
+    if not session.get("user_id") or ep is None or ep in PUBLIC_ENDPOINTS:
+        return None
+    is_self = session.get("role") == ROLE_SELF
+    if is_self and ep not in SELF_ENDPOINTS:
+        return redirect(url_for("self_account"))
+    if not is_self and ep in SELF_ENDPOINTS:
+        flash("حساب الدفع من قبلي له دخول منفصل — سجّل خروج وادخل بيوزره", "warning")
+        return redirect(url_for("dashboard"))
+    return None
 
 
 @app.before_request
@@ -846,7 +876,44 @@ BASE_HTML = """
 } %}
 {% set ep = request.endpoint %}
 
-{% if session.get('user_id') %}
+{% if session.get('user_id') and session.get('role') == 'self' %}
+<div class="layout">
+    <aside class="sidebar">
+        <div class="brand"><span class="logo" style="background:linear-gradient(135deg,#0284c7,#0ea5e9)"><i class="bi bi-piggy-bank"></i></span> الدفع من قبلي</div>
+        <nav class="nav-side">
+            <a href="{{ url_for('self_account') }}" class="active"><i class="bi bi-piggy-bank"></i> يوزرات الدفع من قبلي</a>
+        </nav>
+        <div class="side-foot nav-side">
+            <div class="who"><span class="avatar">{{ (session.get('username') or '?')[:1]|upper }}</span> {{ session.get('username') }}</div>
+            <a href="#" onclick="toggleTheme();return false;"><i class="bi bi-moon-stars"></i> الوضع الليلي</a>
+            <a href="{{ url_for('logout') }}"><i class="bi bi-box-arrow-left"></i> تسجيل الخروج</a>
+        </div>
+    </aside>
+    <div class="flex-grow-1" style="min-width:0">
+        <header class="topbar">
+            <div class="d-flex align-items-center gap-2">
+                <span class="brand p-0"><span class="logo" style="width:34px;height:34px;font-size:1rem;background:linear-gradient(135deg,#0284c7,#0ea5e9)"><i class="bi bi-piggy-bank"></i></span></span>
+                <span class="title">الدفع من قبلي</span>
+            </div>
+            <div class="d-flex gap-2">
+                <button class="icon-btn" onclick="toggleTheme()" aria-label="الوضع الليلي"><i class="bi bi-moon-stars"></i></button>
+                <a class="icon-btn" href="{{ url_for('logout') }}" aria-label="تسجيل الخروج"><i class="bi bi-box-arrow-left"></i></a>
+            </div>
+        </header>
+        <main class="main" style="padding-bottom:40px">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ 'info' if category == 'message' else category }} alert-dismissible fade show">
+                        {{ message }}
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    </div>
+                {% endfor %}
+            {% endwith %}
+            {{ body|safe }}
+        </main>
+    </div>
+</div>
+{% elif session.get('user_id') %}
 <div class="layout">
     <aside class="sidebar">
         <div class="brand"><span class="logo"><i class="bi bi-router"></i></span> محاسبة الإنترنت</div>
@@ -854,7 +921,6 @@ BASE_HTML = """
             <a href="{{ url_for('dashboard') }}" class="{{ 'active' if ep == 'dashboard' }}"><i class="bi bi-grid-1x2"></i> الرئيسية</a>
             <a href="{{ url_for('subscribers') }}" class="{{ 'active' if ep in ['subscribers','subscriber_detail','activate','transfer','import_users','wa_import'] }}"><i class="bi bi-people"></i> المشتركون</a>
             <a href="{{ url_for('debts') }}" class="{{ 'active' if ep == 'debts' }}"><i class="bi bi-journal-text"></i> الديون</a>
-            <a href="{{ url_for('self_account') }}" class="{{ 'active' if ep == 'self_account' }}"><i class="bi bi-piggy-bank"></i> يوزرات الدفع من قبلي</a>
             <a href="{{ url_for('wallet') }}" class="{{ 'active' if ep == 'wallet' }}"><i class="bi bi-wallet2"></i> المحفظة</a>
             <a href="{{ url_for('plans') }}" class="{{ 'active' if ep == 'plans' }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
             <a href="{{ url_for('reports') }}" class="{{ 'active' if ep == 'reports' }}"><i class="bi bi-bar-chart-line"></i> التقارير</a>
@@ -904,7 +970,6 @@ BASE_HTML = """
 <div class="offcanvas offcanvas-bottom" tabindex="-1" id="more" style="height:auto;border-radius:22px 22px 0 0;background:var(--card)">
     <div class="offcanvas-body nav-side pb-4">
         <div class="who mb-2"><span class="avatar">{{ (session.get('username') or '?')[:1]|upper }}</span> {{ session.get('username') }}</div>
-        <a href="{{ url_for('self_account') }}"><i class="bi bi-piggy-bank"></i> يوزرات الدفع من قبلي</a>
         <a href="{{ url_for('wa_import') }}"><i class="bi bi-whatsapp"></i> تفعيلات من واتساب الشركة</a>
         <a href="{{ url_for('reports') }}"><i class="bi bi-bar-chart-line"></i> التقارير</a>
         <a href="{{ url_for('plans') }}"><i class="bi bi-box-seam"></i> الباقات والأسعار</a>
@@ -1005,7 +1070,7 @@ LOGIN_PAGE = """
 @app.route("/", methods=["GET", "POST"])
 def login():
     if "user_id" in session and request.method == "GET":
-        return redirect(url_for("dashboard"))
+        return redirect(home_url())
 
     con = db()
     if request.method == "POST":
@@ -1021,9 +1086,10 @@ def login():
             session.permanent = True
             session["user_id"] = user["id"]
             session["username"] = user["username"]
+            session["role"] = user["role"] if "role" in user.keys() and user["role"] else ROLE_ADMIN
             if token:
                 session["csrf_token"] = token
-            return redirect(url_for("dashboard"))
+            return redirect(home_url())
 
         flash("اسم المستخدم أو كلمة المرور غير صحيحة", "danger")
 
@@ -1135,9 +1201,6 @@ def dashboard():
     balance = wallet_balance(con)
     shop = get_setting(con, "shop_name")
     since, last_charge = collection_since_charge(con)
-    selfacc = self_account_totals(con)
-    selfacc_m = self_account_totals(con, since=month_start)
-    sw_bal = self_wallet_balance(con)
     con.close()
 
     expiring_rows = "".join(f"""
@@ -1178,9 +1241,6 @@ def dashboard():
                   url_for("collection")),
         stat_card("الأرباح هذا الشهر", f"{money(month['profit'])} د.ع", "bi-graph-up-arrow", "#10b981",
                   f"من النقد فقط — الإجمالي: {money(total['profit'])} د.ع"),
-        stat_card("يوزرات الدفع من قبلي", f"{money(selfacc['unpaid'])} د.ع", "bi-piggy-bank", "#0ea5e9",
-                  f"بذمتهم إلك ({selfacc['unpaid_subs']} مشترك) — رصيد الحساب {money(sw_bal)} — ربح الشهر {money(selfacc_m['profit'])}",
-                  url_for("self_account")),
         stat_card("الديون", f"{money(total['debt'])} د.ع", "bi-journal-text", "#ef4444",
                   f"على {total['debt_n']} مشترك", url_for("debts"), cls="col-12 col-md-4"),
     ])
@@ -1503,7 +1563,7 @@ def account_badges(debt, self_paid):
     out = [f'<span class="badge bg-danger">دين {money(debt)}</span>' if debt
            else '<span class="badge bg-success-subtle text-success-emphasis">مسدد</span>']
     if self_paid:
-        out.append(f'<span class="badge bg-info text-dark" title="بذمته إلك بحساب الدفع من قبلي">من قبلي {money(self_paid)}</span>')
+        out.append('<span class="badge bg-info text-dark" title="محوّل لحساب الدفع من قبلي">من قبلي</span>')
     return " ".join(out)
 
 
@@ -1742,7 +1802,7 @@ def subscribers():
                     <option value="active" {"selected" if status == "active" else ""}>فعّال</option>
                     <option value="expired" {"selected" if status == "expired" else ""}>منتهي</option>
                     <option value="debt" {"selected" if status == "debt" else ""}>عليه دين</option>
-                    <option value="self" {"selected" if status == "self" else ""}>من قبلي (بذمته إلك)</option>
+                    <option value="self" {"selected" if status == "self" else ""}>محوّل للدفع من قبلي</option>
                 </select>
                 <select name="plan" class="form-select" style="max-width:180px">
                     <option value="">كل الباقات</option>{plan_filter_opts}
@@ -1835,26 +1895,13 @@ def get_subscriber(con, subscriber_id):
 def self_status(h):
     if h["payment_type"] != PAY_SELF:
         return ""
-    if h["self_collected_at"]:
-        return ' <small class="text-success">✓ رجّعه إلك</small>'
-    return ' <small class="text-info">بذمته إلك</small>'
+    return ' <small class="text-info">بحساب الدفع من قبلي</small>'
 
 
 def op_action(h, subscriber_id):
     """زر العملية بصفحة المشترك: ترحيل للدين، استلمت لـ"من قبلي"، تعديل للباقي."""
     if h["payment_type"] == PAY_DEBT:
         return f'<a href="{url_for("settle_operation", op_id=h["id"])}" class="btn btn-sm btn-warning">ترحيل</a>'
-    if h["payment_type"] == PAY_SELF and not h["self_collected_at"]:
-        return f"""<div class="d-flex gap-1">
-            <form method="post" action="{url_for('self_collect')}">
-                <input type="hidden" name="op_id" value="{h['id']}">
-                <input type="hidden" name="back" value="{url_for('subscriber_detail', subscriber_id=subscriber_id)}">
-                <button class="btn btn-sm btn-success">استلمت</button></form>
-            <a href="{url_for('settle_operation', op_id=h['id'])}" class="btn btn-sm btn-outline-secondary">تعديل</a></div>"""
-    if h["payment_type"] == PAY_SELF:
-        return f"""<form method="post" action="{url_for('self_uncollect')}" data-confirm="ترجّعها غير مسددة؟">
-            <input type="hidden" name="op_id" value="{h['id']}">
-            <button class="btn btn-sm btn-outline-secondary">تراجع</button></form>"""
     return f'<a href="{url_for("settle_operation", op_id=h["id"])}" class="btn btn-sm btn-outline-secondary">تعديل</a>'
 
 
@@ -1950,8 +1997,9 @@ def subscriber_detail(subscriber_id):
             <small class="text-muted">ينتهي: {esc(s['expiry_date'])}</small></div></div>
         <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>دين عليه</h6>
             <h4 class="fw-bold {'text-danger' if debt else 'text-success'}">{money(debt)} د.ع</h4></div></div>
-        <div class="col-6 col-md-3"><a href="{url_for('self_account')}" class="text-decoration-none"><div class="card stat-card p-3"><h6>بذمته إلك (من قبلي)</h6>
-            <h4 class="fw-bold text-info">{money(self_paid)} د.ع</h4></div></a></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>الدفع من قبلي</h6>
+            <h4 class="fw-bold text-info">{'محوّل ✓' if self_paid else '—'}</h4>
+            <small class="text-muted">{'بحساب الدفع من قبلي' if self_paid else 'لا'}</small></div></div>
         <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>المحصّل / الربح</h6>
             <h4 class="fw-bold">{money(collected)}</h4><small class="text-success">ربح {money(profit)} د.ع</small></div></div>
     </div>
@@ -1985,18 +2033,6 @@ def subscriber_detail(subscriber_id):
                 <div class="alert pay-summary mb-3" style="background:var(--soft)"></div>
                 <button class="btn btn-warning"><i class="bi bi-check2"></i> تسجيل الاشتراك السابق</button>
             </div>
-        </form>
-    </div>
-
-    <div class="card p-4 mb-4">
-        <h5><i class="bi bi-piggy-bank text-info"></i> إضافة مبلغ مطلوب سابقاً (حساب الدفع من قبلي)</h5>
-        <p class="text-muted small mb-2">مبلغ قديم دافعه من قبلك. ينضاف على حسابه وينخصم من رصيد حساب الدفع من قبلي — حالياً بذمته: <b>{money(self_paid)} د.ع</b></p>
-        <form method="post" action="{url_for('self_old_add')}" class="row g-2">
-            <input type="hidden" name="subscriber_id" value="{subscriber_id}">
-            <input type="hidden" name="back" value="{url_for('subscriber_detail', subscriber_id=subscriber_id)}">
-            <div class="col-5 col-md-3"><input type="number" name="amount" min="1" class="form-control" placeholder="المبلغ" required></div>
-            <div class="col-7 col-md-6"><input name="notes" class="form-control" placeholder="ملاحظة"></div>
-            <div class="col-12 col-md-3"><button class="btn btn-secondary w-100">إضافة على حسابه</button></div>
         </form>
     </div>
 
@@ -2434,18 +2470,11 @@ def debts():
             </div>
         </div>
         <div class="col-6 col-md-4">
+            <a href="{url_for('collection')}" class="text-decoration-none">
             <div class="card stat-card p-4">
                 <span class="stat-icon" style="background:rgba(16,185,129,.14);color:#10b981"><i class="bi bi-cash-stack"></i></span>
                 <h6>تحصيل المبالغ منذ آخر شحن</h6>
                 <h2 class="text-success">{money(since['collected'])} د.ع</h2>
-            </div>
-        </div>
-        <div class="col-12 col-md-4">
-            <a href="{url_for('self_account')}" class="text-decoration-none">
-            <div class="card stat-card p-4">
-                <span class="stat-icon" style="background:rgba(14,165,233,.14);color:#0ea5e9"><i class="bi bi-piggy-bank"></i></span>
-                <h6>يوزرات الدفع من قبلي</h6>
-                <div class="text-info fw-bold">افتح الحساب ←</div>
             </div>
             </a>
         </div>
@@ -2526,7 +2555,7 @@ def self_account():
     old_got = sum(x["amount"] for x in olds if x["collected_at"])
     old_rows = "".join(f"""
         <tr>
-            <td><a href="{url_for('subscriber_detail', subscriber_id=x['subscriber_id'])}" class="text-decoration-none">{esc(x['name'])}</a></td>
+            <td>{esc(x['name'])}</td>
             <td dir="ltr">{esc(x['username'])}</td>
             <td class="fw-bold">{money(x['amount'])} د.ع</td>
             <td>{esc(x['notes'])}</td>
@@ -2571,7 +2600,7 @@ def self_account():
             for x in d["old"])
         return f"""
         <tr>
-            <td><a href="{url_for('subscriber_detail', subscriber_id=o['subscriber_id'])}" class="fw-bold text-decoration-none">{esc(o['name'])}</a></td>
+            <td class="fw-bold">{esc(o['name'])}</td>
             <td dir="ltr">{esc(o['username'])}</td>
             <td>{f'<span class="badge {"bg-danger" if months > 1 else "bg-warning text-dark"}">{months} اشتراك</span>' if months else ''}
                 <div class="small text-muted">{esc(dates)}</div>{old_html}</td>
@@ -2592,7 +2621,7 @@ def self_account():
     owing_rows = "".join(owing_row(d) for d in owing)
     settled_rows = "".join(f"""
         <tr>
-            <td><a href="{url_for('subscriber_detail', subscriber_id=d['o']['subscriber_id'])}" class="text-decoration-none">{esc(d['o']['name'])}</a></td>
+            <td>{esc(d['o']['name'])}</td>
             <td dir="ltr">{esc(d['o']['username'])}</td>
             <td><span class="badge bg-success">مسدد ✓</span></td>
             <td>{d['paid']}</td>
@@ -4126,10 +4155,11 @@ def settings():
             elif con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
                 flash("اسم المستخدم موجود مسبقاً", "danger")
             else:
-                con.execute("INSERT INTO users(username, password) VALUES (?, ?)",
-                            (username, generate_password_hash(password)))
+                role = ROLE_SELF if request.form.get("role") == ROLE_SELF else ROLE_ADMIN
+                con.execute("INSERT INTO users(username, password, role) VALUES (?, ?, ?)",
+                            (username, generate_password_hash(password), role))
                 con.commit()
-                flash("تمت إضافة المستخدم", "success")
+                flash("تمت إضافة المستخدم" + (" — يدخل على حساب الدفع من قبلي بس" if role == ROLE_SELF else ""), "success")
 
         elif action == "delete_user":
             uid = parse_amount(request.form.get("user_id"))
@@ -4143,7 +4173,7 @@ def settings():
         con.close()
         return redirect(url_for("settings"))
 
-    users = con.execute("SELECT id, username FROM users ORDER BY id").fetchall()
+    users = con.execute("SELECT id, username, role FROM users ORDER BY id").fetchall()
     shop = get_setting(con, "shop_name")
     qp = get_setting(con, "quick_prices", "")
     tg_token = get_setting(con, "tg_token")
@@ -4156,6 +4186,7 @@ def settings():
     user_rows = "".join(f"""
         <tr>
             <td>{esc(u['username'])}</td>
+            <td>{'<span class="badge bg-info text-dark">الدفع من قبلي</span>' if u['role'] == 'self' else '<span class="badge bg-secondary">البرنامج الرئيسي</span>'}</td>
             <td>{'<span class="badge bg-primary">أنت</span>' if u['id'] == session['user_id'] else f'''
                 <form method="post" data-confirm="حذف المستخدم؟">
                     <input type="hidden" name="action" value="delete_user">
@@ -4190,10 +4221,14 @@ def settings():
                 <table class="table"><tbody>{user_rows}</tbody></table>
                 <form method="post" class="row g-2">
                     <input type="hidden" name="action" value="add_user">
-                    <div class="col-5"><input name="username" class="form-control" placeholder="اسم المستخدم" required></div>
-                    <div class="col-4"><input name="password" type="password" minlength="6" class="form-control" placeholder="كلمة المرور" required></div>
-                    <div class="col-3"><button class="btn btn-success w-100">إضافة</button></div>
+                    <div class="col-6"><input name="username" class="form-control" placeholder="اسم المستخدم" required></div>
+                    <div class="col-6"><input name="password" type="password" minlength="6" class="form-control" placeholder="كلمة المرور" required></div>
+                    <div class="col-8"><select name="role" class="form-select">
+                        <option value="admin">البرنامج الرئيسي</option>
+                        <option value="self">حساب الدفع من قبلي بس</option></select></div>
+                    <div class="col-4"><button class="btn btn-success w-100">إضافة</button></div>
                 </form>
+                <small class="text-muted d-block mt-2">يوزر "حساب الدفع من قبلي" لما يدخل يشوف بس يوزرات الدفع من قبلي ورصيدها.</small>
             </div>
         </div>
 
