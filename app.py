@@ -2779,6 +2779,10 @@ def self_name_cell(o, bold=True):
                 <input name="name" value="{esc(o['name'])}" class="form-control form-control-sm" placeholder="الاسم" required>
                 <input name="phone" value="{esc(o['phone'])}" class="form-control form-control-sm" placeholder="رقم الهاتف" dir="ltr" inputmode="tel">
                 <textarea name="self_notes" class="form-control form-control-sm" rows="2" placeholder="ملاحظات">{esc(notes)}</textarea>
+                <div class="d-flex gap-1">
+                    <input name="add_amount" type="number" min="0" class="form-control form-control-sm" placeholder="إضافة مبلغ عليه" inputmode="numeric">
+                    <input name="add_note" class="form-control form-control-sm" placeholder="سبب المبلغ">
+                </div>
                 <label class="small"><input type="checkbox" name="self_only" value="1" class="form-check-input"
                     {'checked' if ('self_only' in o.keys() and o['self_only']) else ''}> خاص بحسابي (ما يطلع بالبرنامج الرئيسي)</label>
                 <button class="btn btn-sm btn-primary">حفظ</button>
@@ -2800,9 +2804,18 @@ def self_edit():
         UPDATE subscribers SET self_name = ?, self_phone = ?, self_notes = ?, self_only = ? WHERE id = ?
     """, (name, form_text("phone"), form_text("self_notes"),
           1 if request.form.get("self_only") == "1" else 0, int(sid)))
+    msg = "تم حفظ التعديل ✅"
+    add = parse_amount(request.form.get("add_amount"))
+    if cur.rowcount and add and add > 0:
+        # مبلغ إضافي بذمته: ينضاف على حسابه وينخصم من رصيد حساب الدفع من قبلي
+        oc = con.execute("INSERT INTO self_old (subscriber_id, amount, notes, created_at) VALUES (?, ?, ?, ?)",
+                         (int(sid), add, form_text("add_note") or "مبلغ مضاف", now_str()))
+        con.execute("INSERT INTO self_wallet (kind, amount, notes, old_id, created_at) VALUES ('خصم', ?, ?, ?, ?)",
+                    (add, f"مبلغ مضاف - {name}", oc.lastrowid, now_str()))
+        msg += f" — وأُضيف {money(add)} د.ع على حسابه"
     con.commit()
     con.close()
-    flash("تم حفظ التعديل ✅" if cur.rowcount else "المشترك غير موجود", "success" if cur.rowcount else "danger")
+    flash(msg if cur.rowcount else "المشترك غير موجود", "success" if cur.rowcount else "danger")
     return redirect(url_for("self_account"))
 
 
