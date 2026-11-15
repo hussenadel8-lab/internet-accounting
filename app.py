@@ -246,6 +246,14 @@ def init_db():
     if not column_exists(cur, "plans", "self_price"):
         cur.execute("ALTER TABLE plans ADD COLUMN self_price INTEGER")
 
+    # self_only = مشترك خاص بحساب الدفع من قبلي (ما يطلع بالبرنامج الرئيسي)
+    # self_name / self_phone = الاسم والهاتف المعدّلين بحساب الدفع من قبلي (ما يغيّرون الرئيسي)
+    if not column_exists(cur, "subscribers", "self_only"):
+        cur.execute("ALTER TABLE subscribers ADD COLUMN self_only INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE subscribers ADD COLUMN self_name TEXT")
+        cur.execute("ALTER TABLE subscribers ADD COLUMN self_phone TEXT")
+        cur.execute("UPDATE subscribers SET self_only = 1 WHERE notes = 'مضاف من قائمة المطلوبين سابقاً'")
+
     # ملاحظات خاصة بحساب الدفع من قبلي لكل مشترك
     if not column_exists(cur, "subscribers", "self_notes"):
         cur.execute("ALTER TABLE subscribers ADD COLUMN self_notes TEXT")
@@ -1130,15 +1138,15 @@ def money_totals(con, since=None, until=None):
         params.append(until)
     cash = con.execute(f"""
         SELECT COUNT(*) AS n, COALESCE(SUM(retail_price), 0) AS total, COALESCE(SUM(profit), 0) AS profit
-        FROM activations WHERE payment_type = 'نقد' {cond}
+        FROM activations WHERE payment_type = 'نقد' AND {MAIN_ONLY} {cond}
     """, params).fetchone()
     mine = con.execute(f"""
         SELECT COUNT(*) AS n, COALESCE(SUM(retail_price), 0) AS total
-        FROM activations WHERE payment_type = 'من قبلي' {cond}
+        FROM activations WHERE payment_type = 'من قبلي' AND {MAIN_ONLY} {cond}
     """, params).fetchone()
-    debt = con.execute("""
+    debt = con.execute(f"""
         SELECT COUNT(DISTINCT subscriber_id) AS n, COALESCE(SUM(amount), 0) AS total
-        FROM activations WHERE payment_type = 'دين'
+        FROM activations WHERE payment_type = 'دين' AND {MAIN_ONLY}
     """).fetchone()
     return {"cash_n": cash["n"], "cash": cash["total"], "profit": cash["profit"],
             "self_n": mine["n"], "self": mine["total"],
@@ -1180,17 +1188,17 @@ def dashboard():
     con = db()
     month_start = date.today().replace(day=1).strftime("%Y-%m-%d")
 
-    subscribers_count = con.execute("SELECT COUNT(*) AS c FROM subscribers").fetchone()["c"]
+    subscribers_count = con.execute("SELECT COUNT(*) AS c FROM subscribers WHERE self_only = 0").fetchone()["c"]
     month = money_totals(con, since=month_start)
     total = money_totals(con)
-    month_ops = con.execute("SELECT COUNT(*) AS c FROM activations WHERE operation_date >= ?",
+    month_ops = con.execute(f"SELECT COUNT(*) AS c FROM activations WHERE operation_date >= ? AND {MAIN_ONLY}",
                             (month_start,)).fetchone()["c"]
 
     warn_until = (date.today() + timedelta(days=EXPIRY_WARNING_DAYS)).strftime("%Y-%m-%d")
     expiring = con.execute("""
         SELECT s.*, p.name AS plan_name
         FROM subscribers s JOIN plans p ON p.id = s.plan_id
-        WHERE s.expiry_date <= ?
+        WHERE s.expiry_date <= ? AND s.self_only = 0
         ORDER BY s.expiry_date DESC
         LIMIT 50
     """, (warn_until,)).fetchall()
@@ -1198,7 +1206,7 @@ def dashboard():
     recent = con.execute("""
         SELECT a.*, s.username AS subscriber_username, p.name AS plan_name
         FROM activations a
-        JOIN subscribers s ON s.id = a.subscriber_id
+        JOIN subscribers s ON s.id = a.subscriber_id AND s.self_only = 0
         JOIN plans p ON p.id = a.plan_id
         ORDER BY a.id DESC LIMIT 8
     """).fetchall()
@@ -1295,7 +1303,7 @@ def collection():
     rows = con.execute(f"""
         SELECT a.*, s.name, s.username, p.name AS plan_name
         FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
-        WHERE a.payment_type IN ('نقد', 'من قبلي') AND a.settled_at IS NOT NULL {cond}
+        WHERE a.payment_type IN ('نقد', 'من قبلي') AND a.settled_at IS NOT NULL AND s.self_only = 0 {cond}
         ORDER BY a.settled_at DESC
     """, params).fetchall()
     charges = con.execute("""
@@ -1688,7 +1696,7 @@ def subscribers():
     status = request.args.get("status", "")
     plan_filter = request.args.get("plan", "")
 
-    where, params = [], []
+    where, params = ["s.self_only = 0"], []
     if q:
         where.append("(s.name LIKE ? OR s.username LIKE ? OR s.phone LIKE ?)")
         params += [f"%{q}%"] * 3
@@ -2436,7 +2444,7 @@ def debts():
     debt_ops = con.execute("""
         SELECT a.*, s.name, s.username, s.phone, s.expiry_date, p.name AS plan_name
         FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
-        WHERE a.payment_type = 'دين'
+        WHERE a.payment_type = 'دين' AND s.self_only = 0
         ORDER BY a.operation_date DESC
     """).fetchall()
     since, _ = collection_since_charge(con)
@@ -2537,8 +2545,9 @@ def self_account_totals(con, since=None):
 @login_required
 def self_account():
     con = db()
-    ops = con.execute("""
-        SELECT a.*, s.name, s.username, s.phone, s.self_notes, s.expiry_date, p.name AS plan_name
+    ops = con.execute(f"""
+        SELECT a.*, {SELF_NAME} AS name, s.username, {SELF_PHONE} AS phone, s.self_notes, s.self_only,
+               s.expiry_date, p.name AS plan_name
         FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
         WHERE a.payment_type = 'من قبلي'
         ORDER BY a.operation_date
@@ -2549,11 +2558,12 @@ def self_account():
     shop = get_setting(con, "shop_name")
     sw_balance = self_wallet_balance(con)
     sw_moves = con.execute("SELECT * FROM self_wallet ORDER BY id DESC LIMIT 100").fetchall()
-    olds = con.execute("""
-        SELECT o.*, s.name, s.username, s.phone, s.self_notes, s.id AS subscriber_id FROM self_old o
+    olds = con.execute(f"""
+        SELECT o.*, {SELF_NAME} AS name, s.username, {SELF_PHONE} AS phone, s.self_notes, s.self_only,
+               s.id AS subscriber_id FROM self_old o
         JOIN subscribers s ON s.id = o.subscriber_id ORDER BY o.id
     """).fetchall()
-    all_subs = con.execute("SELECT id, name, username FROM subscribers ORDER BY name").fetchall()
+    all_subs = con.execute(f"SELECT s.id, {SELF_NAME} AS name, s.username FROM subscribers s ORDER BY 2").fetchall()
     con.close()
     sub_options = "".join(f'<option value="{x["id"]}">{esc(x["name"])} — {esc(x["username"])}</option>' for x in all_subs)
     old_pending = sum(x["amount"] for x in olds if not x["collected_at"])
@@ -2749,6 +2759,13 @@ def self_account():
     return page(body)
 
 
+# شرط: استبعاد مشتركين حساب الدفع من قبلي الخاصين من حسابات البرنامج الرئيسي
+MAIN_ONLY = "subscriber_id NOT IN (SELECT id FROM subscribers WHERE self_only = 1)"
+# الاسم والهاتف كما تظهر بحساب الدفع من قبلي
+SELF_NAME = "COALESCE(NULLIF(s.self_name, ''), s.name)"
+SELF_PHONE = "COALESCE(NULLIF(s.self_phone, ''), s.phone)"
+
+
 def self_name_cell(o, bold=True):
     """اسم المشترك + ملاحظاته + زر تعديل (الاسم، الهاتف، الملاحظات) بحساب الدفع من قبلي."""
     sid = o["subscriber_id"]
@@ -2762,6 +2779,8 @@ def self_name_cell(o, bold=True):
                 <input name="name" value="{esc(o['name'])}" class="form-control form-control-sm" placeholder="الاسم" required>
                 <input name="phone" value="{esc(o['phone'])}" class="form-control form-control-sm" placeholder="رقم الهاتف" dir="ltr" inputmode="tel">
                 <textarea name="self_notes" class="form-control form-control-sm" rows="2" placeholder="ملاحظات">{esc(notes)}</textarea>
+                <label class="small"><input type="checkbox" name="self_only" value="1" class="form-check-input"
+                    {'checked' if ('self_only' in o.keys() and o['self_only']) else ''}> خاص بحسابي (ما يطلع بالبرنامج الرئيسي)</label>
                 <button class="btn btn-sm btn-primary">حفظ</button>
             </form>
         </details>"""
@@ -2776,8 +2795,11 @@ def self_edit():
         flash("الاسم مطلوب", "danger")
         return redirect(url_for("self_account"))
     con = db()
-    cur = con.execute("UPDATE subscribers SET name = ?, phone = ?, self_notes = ? WHERE id = ?",
-                      (name, form_text("phone"), form_text("self_notes"), int(sid)))
+    # التعديل ينحفظ بحساب الدفع من قبلي بس (الاسم والهاتف الأصليين بالبرنامج الرئيسي ما يتغيرون)
+    cur = con.execute("""
+        UPDATE subscribers SET self_name = ?, self_phone = ?, self_notes = ?, self_only = ? WHERE id = ?
+    """, (name, form_text("phone"), form_text("self_notes"),
+          1 if request.form.get("self_only") == "1" else 0, int(sid)))
     con.commit()
     con.close()
     flash("تم حفظ التعديل ✅" if cur.rowcount else "المشترك غير موجود", "success" if cur.rowcount else "danger")
@@ -2838,11 +2860,12 @@ def self_bulk_old():
     """إضافة جماعية للمطلوبين سابقاً من قائمة (اسم + مبلغ)."""
     import json
     con = db()
-    subs = con.execute("SELECT id, name, username FROM subscribers").fetchall()
+    subs = con.execute("SELECT id, name, self_name, username FROM subscribers").fetchall()
     by_name = {}
     for x in subs:
-        by_name.setdefault(norm_name(x["name"]), x)
-        by_name.setdefault(norm_name(x["username"]), x)
+        for key in (x["self_name"], x["name"], x["username"]):
+            if key:
+                by_name.setdefault(norm_name(key), x)
 
     if request.method == "POST" and request.form.get("step") == "confirm":
         n = int(request.form.get("n", "0") or 0)
@@ -2862,8 +2885,8 @@ def self_bulk_old():
                 sid = sub["id"]
             else:
                 cur = con.execute("""
-                    INSERT INTO subscribers (name, username, phone, plan_id, activation_date, expiry_date, notes, created_at)
-                    VALUES (?, ?, '', ?, ?, ?, 'مضاف من قائمة المطلوبين سابقاً', ?)
+                    INSERT INTO subscribers (name, username, phone, plan_id, activation_date, expiry_date, notes, created_at, self_only)
+                    VALUES (?, ?, '', ?, ?, ?, 'مضاف من قائمة المطلوبين سابقاً', ?, 1)
                 """, (name, name, plan["id"], today_str(), today_str(), now_str()))
                 sid = cur.lastrowid
                 created[key] = {"id": sid}
@@ -3339,9 +3362,9 @@ def import_users():
             else:
                 cur = con.execute("""
                     INSERT INTO subscribers
-                    (name, username, phone, plan_id, activation_date, expiry_date, notes, created_at)
-                    VALUES (?, ?, '', ?, ?, ?, ?, ?)
-                """, (name, r["username"], plan_id, start, expiry, "", now))
+                    (name, username, phone, plan_id, activation_date, expiry_date, notes, created_at, self_only)
+                    VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)
+                """, (name, r["username"], plan_id, start, expiry, "", now, 1 if is_self else 0))
                 added += 1
                 sid = cur.lastrowid
             if prev_type in PAY_TYPES and record_previous(
@@ -3581,7 +3604,7 @@ def find_activations_in_chat(con, text):
     for s in con.execute("""
         SELECT s.id, s.name, s.username, s.plan_id, s.expiry_date, p.name AS plan_name,
                p.wholesale_price, p.retail_price
-        FROM subscribers s JOIN plans p ON p.id = s.plan_id
+        FROM subscribers s JOIN plans p ON p.id = s.plan_id WHERE s.self_only = 0
     """):
         subs.setdefault(s["username"].strip().lower(), dict(s))
     plans_list = con.execute("SELECT * FROM plans").fetchall()
@@ -4060,7 +4083,7 @@ def fetch_activations(con, start, end_full):
                a.notes,
                a.operation_date
         FROM activations a
-        JOIN subscribers s ON s.id = a.subscriber_id
+        JOIN subscribers s ON s.id = a.subscriber_id AND s.self_only = 0
         JOIN plans p ON p.id = a.plan_id
         WHERE a.operation_date BETWEEN ? AND ?
         ORDER BY a.id DESC
@@ -4084,12 +4107,12 @@ def reports():
     con = db()
     activations = fetch_activations(con, start, end_full)
     charges = fetch_wallet(con, start, end_full, only_charges=True)
-    by_plan = con.execute("""
+    by_plan = con.execute(f"""
         SELECT p.category, p.name, COUNT(*) AS ops, SUM(a.amount) AS cost,
                SUM(CASE WHEN a.payment_type = 'نقد' THEN a.retail_price ELSE 0 END) AS sales,
                SUM(CASE WHEN a.payment_type = 'نقد' THEN a.profit ELSE 0 END) AS profit
         FROM activations a JOIN plans p ON p.id = a.plan_id
-        WHERE a.operation_date BETWEEN ? AND ?
+        WHERE a.operation_date BETWEEN ? AND ? AND a.{MAIN_ONLY}
         GROUP BY p.id ORDER BY profit DESC
     """, (start, end_full)).fetchall()
     totals = money_totals(con, since=start, until=end_full)
@@ -4254,7 +4277,7 @@ def report_list(kind):
             SELECT s.name, s.username, s.phone, p.name AS plan_name, a.retail_price, a.profit,
                    a.operation_date, a.settled_at
             FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
-            WHERE a.payment_type = 'نقد' AND a.settled_at BETWEEN ? AND ?
+            WHERE a.payment_type = 'نقد' AND a.settled_at BETWEEN ? AND ? AND s.self_only = 0
             ORDER BY a.settled_at DESC
         """, (start, end_full + ".999999")).fetchall()
         headers = ["الاسم", "اليوزر", "الهاتف", "الباقة", "المبلغ", "الربح", "تاريخ التفعيل", "تاريخ الاستلام"]
@@ -4266,7 +4289,7 @@ def report_list(kind):
         data = con.execute("""
             SELECT s.name, s.username, s.phone, p.name AS plan_name, a.amount, a.retail_price, a.operation_date
             FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
-            WHERE a.payment_type = 'دين' ORDER BY a.operation_date
+            WHERE a.payment_type = 'دين' AND s.self_only = 0 ORDER BY a.operation_date
         """).fetchall()
         today = date.today()
         headers = ["الاسم", "اليوزر", "الهاتف", "الباقة", "الدين (الجملة)", "سعر البيع", "تاريخ التفعيل", "أيام"]
@@ -4295,13 +4318,13 @@ def self_report(kind):
     start, end, end_full = report_range()
     con = db()
     if kind == "received":
-        ops = con.execute("""
-            SELECT s.name, s.username, p.name AS plan_name, a.retail_price, a.profit, a.self_collected_at AS at
+        ops = con.execute(f"""
+            SELECT {SELF_NAME} AS name, s.username, p.name AS plan_name, a.retail_price, a.profit, a.self_collected_at AS at
             FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
             WHERE a.payment_type = 'من قبلي' AND a.self_collected_at BETWEEN ? AND ?
         """, (start, end_full + ".999999")).fetchall()
-        olds = con.execute("""
-            SELECT s.name, s.username, o.amount, o.notes, o.collected_at AS at
+        olds = con.execute(f"""
+            SELECT {SELF_NAME} AS name, s.username, o.amount, o.notes, o.collected_at AS at
             FROM self_old o JOIN subscribers s ON s.id = o.subscriber_id
             WHERE o.collected_at BETWEEN ? AND ?
         """, (start, end_full + ".999999")).fetchall()
@@ -4312,13 +4335,13 @@ def self_report(kind):
         totals = ["المجموع", f"{len({r[1] for r in raw})} مشترك", "", sum(r[3] for r in raw), sum(r[4] for r in raw), ""]
         title, icon, note, dated = "المستلم منهم", "bi-cash-coin text-success", "منو انطاك فلوس، حسب تاريخ الاستلام.", True
     elif kind == "unpaid":
-        ops = con.execute("""
-            SELECT s.name, s.username, s.phone, p.name AS plan_name, a.retail_price, a.operation_date AS at
+        ops = con.execute(f"""
+            SELECT {SELF_NAME} AS name, s.username, {SELF_PHONE} AS phone, p.name AS plan_name, a.retail_price, a.operation_date AS at
             FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
             WHERE a.payment_type = 'من قبلي' AND a.self_collected_at IS NULL
         """).fetchall()
-        olds = con.execute("""
-            SELECT s.name, s.username, s.phone, o.amount, o.notes, o.created_at AS at
+        olds = con.execute(f"""
+            SELECT {SELF_NAME} AS name, s.username, {SELF_PHONE} AS phone, o.amount, o.notes, o.created_at AS at
             FROM self_old o JOIN subscribers s ON s.id = o.subscriber_id WHERE o.collected_at IS NULL
         """).fetchall()
         raw = [[o["name"], o["username"], o["phone"], f"اشتراك {o['plan_name']}", o["retail_price"], o["at"][:10]] for o in ops]
