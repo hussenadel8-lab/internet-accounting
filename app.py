@@ -4161,6 +4161,16 @@ def settings():
                 con.commit()
                 flash("تمت إضافة المستخدم" + (" — يدخل على حساب الدفع من قبلي بس" if role == ROLE_SELF else ""), "success")
 
+        elif action == "set_password":
+            uid = parse_amount(request.form.get("user_id"))
+            new = request.form.get("new_password", "")
+            if len(new) < 6:
+                flash("كلمة السر لازم تكون 6 أحرف أو أكثر", "danger")
+            elif con.execute("UPDATE users SET password = ? WHERE id = ?",
+                             (generate_password_hash(new), uid)).rowcount:
+                con.commit()
+                flash("تم تغيير كلمة سر المستخدم ✅", "success")
+
         elif action == "delete_user":
             uid = parse_amount(request.form.get("user_id"))
             if uid == session["user_id"]:
@@ -4188,11 +4198,19 @@ def settings():
             <td>{esc(u['username'])}</td>
             <td>{'<span class="badge bg-info text-dark">الدفع من قبلي</span>' if u['role'] == 'self' else '<span class="badge bg-secondary">البرنامج الرئيسي</span>'}</td>
             <td>{'<span class="badge bg-primary">أنت</span>' if u['id'] == session['user_id'] else f'''
-                <form method="post" data-confirm="حذف المستخدم؟">
-                    <input type="hidden" name="action" value="delete_user">
-                    <input type="hidden" name="user_id" value="{u['id']}">
-                    <button class="btn btn-sm btn-outline-danger">حذف</button>
-                </form>'''}</td>
+                <div class="d-flex flex-wrap gap-1">
+                    <form method="post" class="d-flex gap-1">
+                        <input type="hidden" name="action" value="set_password">
+                        <input type="hidden" name="user_id" value="{u['id']}">
+                        <input type="password" name="new_password" minlength="6" class="form-control form-control-sm" style="max-width:130px" placeholder="كلمة سر جديدة" required>
+                        <button class="btn btn-sm btn-outline-primary">تغيير</button>
+                    </form>
+                    <form method="post" data-confirm="حذف المستخدم؟">
+                        <input type="hidden" name="action" value="delete_user">
+                        <input type="hidden" name="user_id" value="{u['id']}">
+                        <button class="btn btn-sm btn-outline-danger">حذف</button>
+                    </form>
+                </div>'''}</td>
         </tr>""" for u in users)
 
     body = f"""
