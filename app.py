@@ -530,7 +530,7 @@ ROLE_ADMIN, ROLE_SELF = "admin", "self"
 # صفحات حساب الدفع من قبلي (تفتح بس بيوزر هذا الحساب)
 SHARED_ENDPOINTS = {"import_users"}  # تفتح للحسابين (كل واحد بطريقته)
 SELF_ENDPOINTS = {"self_account", "self_collect", "self_old_add", "self_old_delete", "self_report",
-                  "self_wallet_move", "self_uncollect"}
+                  "self_wallet_move", "self_uncollect", "self_bulk_old"}
 PUBLIC_ENDPOINTS = {"login", "logout", "static", "manifest", "service_worker", "offline"}
 
 
@@ -2685,7 +2685,8 @@ def self_account():
 
     <div class="card p-4 mb-4" style="border:2px solid #64748b">
         <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
-            <h5 class="mb-0"><i class="bi bi-clock-history text-secondary"></i> المطلوبين سابقاً</h5>
+            <h5 class="mb-0"><i class="bi bi-clock-history text-secondary"></i> المطلوبين سابقاً
+                <a href="{url_for('self_bulk_old')}" class="btn btn-sm btn-outline-secondary ms-2"><i class="bi bi-list-ul"></i> إضافة قائمة</a></h5>
             <div><span class="badge bg-secondary fs-6">غير مستلم: {money(old_pending)} د.ع</span>
                  <span class="badge bg-success-subtle text-success-emphasis fs-6">مستلم: {money(old_got)} د.ع</span></div>
         </div>
@@ -2761,6 +2762,159 @@ def self_wallet_move():
     con.close()
     flash(f"تم {'شحن' if kind == SW_TOPUP else 'سحب'} {money(amount)} د.ع — رصيد حساب الدفع من قبلي: {money(bal)} د.ع", "success")
     return redirect(url_for("self_account"))
+
+
+def norm_name(name):
+    """توحيد الاسم للمقارنة: الهمزات، التاء المربوطة، الياء، والمسافات."""
+    name = (name or "").replace("ـ", "")
+    for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي")):
+        name = name.replace(a, b)
+    return " ".join(name.split()).lower()
+
+
+def parse_owed_lines(text):
+    """كل سطر: اسم + مبلغ (بالآلاف إذا أقل من 1000). يرجع [(الاسم، المبلغ أو None)]."""
+    out = []
+    for line in (text or "").translate(_AR_DIGITS).splitlines():
+        line = _INVISIBLE.sub("", line).strip(" -–—:،,.\t")
+        if not line:
+            continue
+        nums = re.findall(r"\d[\d,]*", line)
+        amount = None
+        if nums:
+            amount = parse_amount(nums[-1])
+            if amount is not None and amount < 1000:
+                amount *= 1000
+            line = line[:line.rfind(nums[-1])] + line[line.rfind(nums[-1]) + len(nums[-1]):]
+        name = re.sub(r"\b(باقي|المتبقي|متبقي|الف|ألف|دينار|د\.ع)\b", " ", line)
+        name = " ".join(name.replace("د.ع", " ").split()).strip(" -–—:،,.")
+        if name:
+            out.append((name, amount))
+    return out
+
+
+@app.route("/self-account/bulk-old", methods=["GET", "POST"])
+@login_required
+def self_bulk_old():
+    """إضافة جماعية للمطلوبين سابقاً من قائمة (اسم + مبلغ)."""
+    import json
+    con = db()
+    subs = con.execute("SELECT id, name, username FROM subscribers").fetchall()
+    by_name = {}
+    for x in subs:
+        by_name.setdefault(norm_name(x["name"]), x)
+        by_name.setdefault(norm_name(x["username"]), x)
+
+    if request.method == "POST" and request.form.get("step") == "confirm":
+        n = int(request.form.get("n", "0") or 0)
+        plan = (con.execute("SELECT * FROM plans WHERE name = 'Basic'").fetchone()
+                or con.execute("SELECT * FROM plans ORDER BY id").fetchone())
+        created, added, total = {}, 0, 0
+        for i in range(n):
+            if request.form.get(f"use_{i}") != "1":
+                continue
+            name = form_text(f"name_{i}")
+            amount = parse_amount(request.form.get(f"amount_{i}"))
+            if not name or not amount or amount <= 0:
+                continue
+            key = norm_name(name)
+            sub = by_name.get(key) or created.get(key)
+            if sub:
+                sid = sub["id"]
+            else:
+                cur = con.execute("""
+                    INSERT INTO subscribers (name, username, phone, plan_id, activation_date, expiry_date, notes, created_at)
+                    VALUES (?, ?, '', ?, ?, ?, 'مضاف من قائمة المطلوبين سابقاً', ?)
+                """, (name, name, plan["id"], today_str(), today_str(), now_str()))
+                sid = cur.lastrowid
+                created[key] = {"id": sid}
+            cur = con.execute("INSERT INTO self_old (subscriber_id, amount, notes, created_at) VALUES (?, ?, ?, ?)",
+                              (sid, amount, form_text(f"note_{i}") or "مطلوب سابقاً", now_str()))
+            con.execute("INSERT INTO self_wallet (kind, amount, notes, old_id, created_at) VALUES ('خصم', ?, ?, ?, ?)",
+                        (amount, f"مبلغ سابق - {name}", cur.lastrowid, now_str()))
+            added += 1
+            total += amount
+        con.commit()
+        con.close()
+        flash(f"تمت إضافة {added} مبلغ مجموعها {money(total)} د.ع — وأُضيف {len(created)} مشترك جديد"
+              f" — وانخصمت من رصيد الحساب", "success" if added else "warning")
+        return redirect(url_for("self_account"))
+
+    if request.method == "POST" and request.form.get("step") == "read":
+        lines = parse_owed_lines(request.form.get("text"))
+        olds = {(r["subscriber_id"], r["amount"]) for r in con.execute(
+            "SELECT subscriber_id, amount FROM self_old WHERE collected_at IS NULL")}
+        con.close()
+        if not lines:
+            flash("الصق القائمة: كل سطر اسم ومبلغ", "warning")
+            return redirect(url_for("self_bulk_old"))
+        seen = {}
+        rows = ""
+        for i, (name, amount) in enumerate(lines):
+            key = norm_name(name)
+            sub = by_name.get(key)
+            dup = key in seen
+            seen[key] = seen.get(key, 0) + 1
+            if sub and (sub["id"], amount) in olds:
+                status, checked = '<span class="badge bg-secondary">مضاف من قبل</span>', False
+            elif sub:
+                status, checked = f'<span class="badge bg-warning text-dark">موجود بالبرنامج</span> <small class="text-muted">{esc(sub["username"])}</small>', False
+            else:
+                status, checked = '<span class="badge bg-success">جديد</span>', True
+            if dup:
+                status += ' <span class="badge bg-info text-dark">مكرر بالقائمة</span>'
+            if not amount:
+                checked = False
+                status += ' <span class="badge bg-danger">بدون مبلغ</span>'
+            rows += f"""
+            <tr>
+                <td><input type="checkbox" name="use_{i}" value="1" class="form-check-input row-check" {'checked' if checked else ''}></td>
+                <td><input name="name_{i}" value="{esc(name)}" class="form-control form-control-sm"></td>
+                <td><input name="amount_{i}" type="number" min="0" value="{amount or ''}" class="form-control form-control-sm" placeholder="المبلغ"
+                     oninput="if(this.value>0) this.closest('tr').querySelector('.row-check').checked=true"></td>
+                <td><input name="note_{i}" value="مطلوب سابقاً" class="form-control form-control-sm"></td>
+                <td>{status}</td>
+            </tr>"""
+        body = f"""
+        <h2 class="mb-4">إضافة المطلوبين سابقاً (قائمة)</h2>
+        <form method="post">
+            <input type="hidden" name="step" value="confirm">
+            <input type="hidden" name="n" value="{len(lines)}">
+            <div class="alert alert-info small">
+                <b>جديد</b> = ينضاف مشترك جديد بهالاسم ويا مبلغه. <b>موجود بالبرنامج</b> = ما ينضاف (أشّر عليه إذا تريد تضيف المبلغ على حسابه).
+                <b>مكرر بالقائمة</b> = نفس الاسم ينحسب شخص واحد ويا المبلغين. المبالغ تنخصم من رصيد حساب الدفع من قبلي.
+            </div>
+            <div class="card p-4 mb-3">
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead><tr><th></th><th>الاسم</th><th>المبلغ</th><th>ملاحظة</th><th>الحالة</th></tr></thead>
+                        <tbody>{rows}</tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="d-flex gap-2 import-actions">
+                <button class="btn btn-success flex-fill py-3"><i class="bi bi-check2-all"></i> إضافة المحددين</button>
+                <a href="{url_for('self_bulk_old')}" class="btn btn-outline-secondary py-3">رجوع</a>
+            </div>
+        </form>
+        """
+        return page(body)
+
+    con.close()
+    body = f"""
+    <h2 class="mb-4">إضافة المطلوبين سابقاً (قائمة)</h2>
+    <div class="card p-4" style="max-width:720px">
+        <p class="text-muted">الصق القائمة: <b>كل سطر اسم ومبلغ</b>. المبلغ بالآلاف مقبول (36 = 36,000).
+        بعدها تطلعلك معاينة قبل الحفظ.</p>
+        <form method="post">
+            <input type="hidden" name="step" value="read">
+            <textarea name="text" class="form-control mb-3" rows="12" dir="auto" placeholder="سيد جعفر 20&#10;حيدر نبيل 36&#10;مشرق باقي 10"></textarea>
+            <button class="btn btn-primary w-100 py-3"><i class="bi bi-search"></i> قراءة القائمة</button>
+        </form>
+        <a href="{url_for('self_account')}" class="btn btn-outline-secondary mt-3">رجوع لحسابي</a>
+    </div>
+    """
+    return page(body)
 
 
 @app.route("/self-account/old", methods=["POST"])
