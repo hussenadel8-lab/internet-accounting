@@ -528,7 +528,8 @@ app.jinja_env.globals["csrf_token"] = csrf_token
 
 ROLE_ADMIN, ROLE_SELF = "admin", "self"
 # صفحات حساب الدفع من قبلي (تفتح بس بيوزر هذا الحساب)
-SELF_ENDPOINTS = {"self_account", "self_collect", "self_old_add", "self_old_delete",
+SHARED_ENDPOINTS = {"import_users"}  # تفتح للحسابين (كل واحد بطريقته)
+SELF_ENDPOINTS = {"self_account", "self_collect", "self_old_add", "self_old_delete", "self_report",
                   "self_wallet_move", "self_uncollect"}
 PUBLIC_ENDPOINTS = {"login", "logout", "static", "manifest", "service_worker", "offline"}
 
@@ -544,7 +545,7 @@ def role_access():
     if not session.get("user_id") or ep is None or ep in PUBLIC_ENDPOINTS:
         return None
     is_self = session.get("role") == ROLE_SELF
-    if is_self and ep not in SELF_ENDPOINTS:
+    if is_self and ep not in SELF_ENDPOINTS | SHARED_ENDPOINTS:
         return redirect(url_for("self_account"))
     if not is_self and ep in SELF_ENDPOINTS:
         flash("حساب الدفع من قبلي له دخول منفصل — سجّل خروج وادخل بيوزره", "warning")
@@ -1240,7 +1241,7 @@ def dashboard():
                   f"منذ آخر شحن ({esc((last_charge or 'البداية')[:16])}) — نقد {money(since['cash'])} + من قبلي {money(since['self'])} — اضغط للتفاصيل",
                   url_for("collection")),
         stat_card("الأرباح هذا الشهر", f"{money(month['profit'])} د.ع", "bi-graph-up-arrow", "#10b981",
-                  f"من النقد فقط — الإجمالي: {money(total['profit'])} د.ع"),
+                  "من النقد فقط — يتصفر أول كل شهر"),
         stat_card("الديون", f"{money(total['debt'])} د.ع", "bi-journal-text", "#ef4444",
                   f"على {total['debt_n']} مشترك", url_for("debts"), cls="col-12 col-md-4"),
     ])
@@ -2645,7 +2646,7 @@ def self_account():
                 <span class="stat-icon" style="background:rgba(16,185,129,.14);color:#10b981"><i class="bi bi-graph-up-arrow"></i></span>
                 <h6>أرباح هذا الحساب (الشهر)</h6>
                 <h2 class="text-success">{money(month['profit'])} د.ع</h2>
-                <small class="text-muted">الإجمالي: {money(total['profit'])} د.ع</small>
+                <small class="text-muted">يتصفر أول كل شهر</small>
             </div>
         </div>
         <div class="col-12 col-md-4">
@@ -2655,6 +2656,14 @@ def self_account():
                 <h2 class="text-primary">{money(month['got'])} د.ع</h2>
                 <small class="text-muted">{month['got_n']} اشتراك</small>
             </div>
+        </div>
+    </div>
+
+    <div class="card p-3 mb-4">
+        <div class="d-flex flex-wrap gap-2 align-items-center">
+            <a href="{url_for('import_users')}" class="btn btn-primary"><i class="bi bi-file-earmark-arrow-up"></i> تحميل تقرير الشركة (PDF)</a>
+            <a href="{url_for('self_report', kind='received')}" class="btn btn-outline-success"><i class="bi bi-cash-coin"></i> تقرير المستلم منهم</a>
+            <a href="{url_for('self_report', kind='unpaid')}" class="btn btn-outline-warning"><i class="bi bi-hourglass-split"></i> تقرير الي ما مسددين</a>
         </div>
     </div>
 
@@ -3036,6 +3045,7 @@ def _cleanup_imports():
 @login_required
 def import_users():
     import json
+    is_self = session.get("role") == ROLE_SELF
 
     if request.method == "POST" and request.form.get("step") == "upload":
         file = request.files.get("file")
@@ -3084,8 +3094,8 @@ def import_users():
         with open(path, encoding="utf-8") as f:
             rows = json.load(f)["rows"]
 
-        update_existing = request.form.get("update_existing") == "1"
-        prev_type = request.form.get("prev_type", "")
+        update_existing = request.form.get("update_existing") == "1" or is_self
+        prev_type = PAY_SELF if is_self else request.form.get("prev_type", "")
         recorded = 0
         profit = parse_amount(request.form.get("profit"))
         profit = PROFIT if profit is None or profit < 0 else profit
@@ -3161,7 +3171,7 @@ def import_users():
         if created_plans:
             msg += f" — وأُضيفت {created_plans} باقة جديدة (راجع أسعارها من صفحة الباقات)"
         flash(msg, "success")
-        return redirect(url_for("subscribers"))
+        return redirect(url_for("self_account") if is_self else url_for("subscribers"))
 
     # --- عرض المعاينة ---
     token = request.args.get("t")
@@ -3213,6 +3223,29 @@ def import_users():
                 <td>{badge}</td>
             </tr>"""
 
+        self_import_note = """
+                    <div class="col-md-8"><div class="alert alert-info small mb-0">
+                        كل اليوزرات المحددة تنسجل <b>من قبلي</b> بحسابك: ينخصم سعر الجملة (من الملف) من رصيد حساب
+                        الدفع من قبلي، وبذمة كل مشترك سعر "من قبلي" لباقته. الي مسجل بنفس التاريخ ما يتكرر.
+                    </div></div>"""
+        main_import_opts = """
+                    <div class="col-md-8">
+                        <label class="form-label">تسجيل اشتراكاتهم بالحسابات (بدون خصم من المحفظة)</label>
+                        <select name="prev_type" class="form-select">
+                            <option value="دين" selected>سجّلها دين (ما استلمت منهم بعد)</option>
+                            <option value="نقد">سجّلها نقد (استلمت منهم)</option>
+                            <option value="من قبلي">سجّلها من قبلي</option>
+                            <option value="">لا تسجّل — بس أضيف البيانات</option>
+                        </select>
+                    </div>
+                    <div class="col-12">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" name="update_existing" value="1" id="upd" checked>
+                            <label class="form-check-label" for="upd">
+                                اليوزرات الموجودة: حدّث الباقة وتاريخ التفعيل والانتهاء (إذا تاريخ الملف أحدث)
+                            </label>
+                        </div>
+                    </div>"""
         body = f"""
         <h2 class="mb-4">استيراد اليوزرات</h2>
         <form method="post">
@@ -3240,23 +3273,7 @@ def import_users():
                         <label class="form-label">الربح للباقات الجديدة</label>
                         <input type="number" name="profit" min="0" value="{PROFIT}" class="form-control">
                     </div>
-                    <div class="col-md-8">
-                        <label class="form-label">تسجيل اشتراكاتهم بالحسابات (بدون خصم من المحفظة)</label>
-                        <select name="prev_type" class="form-select">
-                            <option value="دين" selected>سجّلها دين (ما استلمت منهم بعد)</option>
-                            <option value="نقد">سجّلها نقد (استلمت منهم)</option>
-                            <option value="من قبلي">سجّلها من قبلي</option>
-                            <option value="">لا تسجّل — بس أضيف البيانات</option>
-                        </select>
-                    </div>
-                    <div class="col-12">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" name="update_existing" value="1" id="upd" checked>
-                            <label class="form-check-label" for="upd">
-                                اليوزرات الموجودة: حدّث الباقة وتاريخ التفعيل والانتهاء (إذا تاريخ الملف أحدث)
-                            </label>
-                        </div>
-                    </div>
+                    {self_import_note if is_self else main_import_opts}
                 </div>
             </div>
 
@@ -3301,8 +3318,10 @@ def import_users():
         <ul class="text-muted small mt-3 mb-0">
             <li>ما ينضاف شي قبل ما تأكد بالمعاينة.</li>
             <li>اليوزر المكرر بالملف ينحسب مرة وحدة بآخر تاريخ.</li>
-            <li>الاستيراد ما يخصم من المحفظة. تكدر تسجّل اشتراكاتهم <b>دين</b> حتى تنحسب بالديون.</li>
+            {'<li>اليوزرات تنسجل <b>من قبلي</b> بحسابك، وينخصم سعر جملتها من رصيد الحساب.</li>' if is_self else
+             '<li>الاستيراد ما يخصم من المحفظة. تكدر تسجّل اشتراكاتهم <b>دين</b> حتى تنحسب بالديون.</li>'}
         </ul>
+        {f'<a href="{url_for("self_account")}" class="btn btn-outline-secondary mt-3">رجوع لحسابي</a>' if is_self else ''}
     </div>
     """
     return page(body)
@@ -3938,6 +3957,14 @@ def reports():
         </form>
     </div>
 
+    <div class="card p-3 mb-4 no-print">
+        <div class="d-flex flex-wrap gap-2 align-items-center">
+            <b class="me-2">تقارير:</b>
+            <a href="{url_for('report_list', kind='received')}{qs}" class="btn btn-outline-success"><i class="bi bi-cash-coin"></i> المستلم منهم</a>
+            <a href="{url_for('report_list', kind='unpaid')}" class="btn btn-outline-danger"><i class="bi bi-journal-text"></i> الي ما دافعين بعد</a>
+        </div>
+    </div>
+
     <p class="text-muted">الفترة: من <b>{start}</b> إلى <b>{end}</b></p>
 
     <div class="row g-3 mb-2">
@@ -3986,6 +4013,141 @@ def reports():
     </div>
     """
     return page(body)
+
+
+def report_page(title, icon, headers, rows, totals, endpoint, kind, start, end, note="", back=None, dated=True):
+    """صفحة تقرير بجدول + فلتر تاريخ + تنزيل Excel."""
+    qs = {"from": start, "to": end}
+    head = "".join(f"<th>{esc(h)}</th>" for h in headers)
+    body_rows = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+    tot = "".join(f"<td><b>{c}</b></td>" for c in totals) if totals else ""
+    date_form = f"""
+        <form method="get" class="row g-2 align-items-end mb-3 no-print">
+            <div class="col-5 col-md-3"><label class="form-label">من</label><input type="date" name="from" value="{start}" class="form-control"></div>
+            <div class="col-5 col-md-3"><label class="form-label">إلى</label><input type="date" name="to" value="{end}" class="form-control"></div>
+            <div class="col-2 col-md-2"><button class="btn btn-primary w-100"><i class="bi bi-search"></i></button></div>
+        </form>""" if dated else ""
+    html = f"""
+    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+        <h2 class="mb-0"><i class="bi {icon}"></i> {esc(title)}</h2>
+        <div class="d-flex gap-2 no-print">
+            <a href="{url_for(endpoint, kind=kind, excel=1, **qs)}" class="btn btn-success"><i class="bi bi-file-earmark-excel"></i> Excel</a>
+            <button onclick="window.print()" class="btn btn-outline-secondary"><i class="bi bi-printer"></i></button>
+            {f'<a href="{back}" class="btn btn-outline-secondary">رجوع</a>' if back else ''}
+        </div>
+    </div>
+    {date_form}
+    {f'<p class="text-muted small">{note}</p>' if note else ''}
+    <div class="card p-4">
+        <div class="table-responsive">
+            <table class="table table-striped">
+                <thead><tr>{head}</tr></thead>
+                <tbody>{body_rows or f'<tr><td colspan="{len(headers)}" class="text-muted text-center">ماكو بيانات</td></tr>'}</tbody>
+                {f'<tfoot><tr>{tot}</tr></tfoot>' if rows and totals else ''}
+            </table>
+        </div>
+    </div>"""
+    return page(html)
+
+
+@app.route("/reports/list/<kind>")
+@login_required
+def report_list(kind):
+    """تقارير البرنامج الرئيسي: المستلم منهم (نقد) / الي ما دافعين (دين)."""
+    start, end, end_full = report_range()
+    con = db()
+    if kind == "received":
+        data = con.execute("""
+            SELECT s.name, s.username, s.phone, p.name AS plan_name, a.retail_price, a.profit,
+                   a.operation_date, a.settled_at
+            FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
+            WHERE a.payment_type = 'نقد' AND a.settled_at BETWEEN ? AND ?
+            ORDER BY a.settled_at DESC
+        """, (start, end_full + ".999999")).fetchall()
+        headers = ["الاسم", "اليوزر", "الهاتف", "الباقة", "المبلغ", "الربح", "تاريخ التفعيل", "تاريخ الاستلام"]
+        raw = [[d["name"], d["username"], d["phone"], d["plan_name"], d["retail_price"], d["profit"],
+                d["operation_date"][:10], (d["settled_at"] or "")[:16]] for d in data]
+        totals = ["المجموع", f"{len(raw)} عملية", "", "", sum(r[4] for r in raw), sum(r[5] for r in raw), "", ""]
+        title, icon, note, dated = "المستلم منهم (نقد)", "bi-cash-coin text-success", "حسب تاريخ الاستلام.", True
+    elif kind == "unpaid":
+        data = con.execute("""
+            SELECT s.name, s.username, s.phone, p.name AS plan_name, a.amount, a.retail_price, a.operation_date
+            FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
+            WHERE a.payment_type = 'دين' ORDER BY a.operation_date
+        """).fetchall()
+        today = date.today()
+        headers = ["الاسم", "اليوزر", "الهاتف", "الباقة", "الدين (الجملة)", "سعر البيع", "تاريخ التفعيل", "أيام"]
+        raw = [[d["name"], d["username"], d["phone"], d["plan_name"], d["amount"], d["retail_price"],
+                d["operation_date"][:10],
+                (today - datetime.strptime(d["operation_date"][:10], "%Y-%m-%d").date()).days] for d in data]
+        totals = ["المجموع", f"{len({r[1] for r in raw})} مشترك", "", "", sum(r[4] for r in raw), sum(r[5] for r in raw), "", ""]
+        title, icon, note, dated = "الي ما دافعين بعد (الديون)", "bi-journal-text text-danger", "كل الديون الحالية.", False
+    else:
+        con.close()
+        return redirect(url_for("reports"))
+    con.close()
+    if request.args.get("excel"):
+        return excel_response(title[:30], headers, raw, f"{kind}_{start}_{end}.xlsx", totals)
+    shown = [[esc(r[0]), f'<span dir="ltr">{esc(r[1])}</span>', f'<span dir="ltr">{esc(r[2])}</span>', esc(r[3]),
+              money(r[4]), money(r[5]), esc(r[6]), esc(r[7])] for r in raw]
+    tshown = [totals[0], totals[1], "", "", money(totals[4]), money(totals[5]), "", ""]
+    return report_page(title, icon, headers, shown, tshown, "report_list", kind, start, end, note,
+                       url_for("reports"), dated)
+
+
+@app.route("/self-account/report/<kind>")
+@login_required
+def self_report(kind):
+    """تقارير حساب الدفع من قبلي: المستلم منهم / الي ما مسددين."""
+    start, end, end_full = report_range()
+    con = db()
+    if kind == "received":
+        ops = con.execute("""
+            SELECT s.name, s.username, p.name AS plan_name, a.retail_price, a.profit, a.self_collected_at AS at
+            FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
+            WHERE a.payment_type = 'من قبلي' AND a.self_collected_at BETWEEN ? AND ?
+        """, (start, end_full + ".999999")).fetchall()
+        olds = con.execute("""
+            SELECT s.name, s.username, o.amount, o.notes, o.collected_at AS at
+            FROM self_old o JOIN subscribers s ON s.id = o.subscriber_id
+            WHERE o.collected_at BETWEEN ? AND ?
+        """, (start, end_full + ".999999")).fetchall()
+        raw = [[o["name"], o["username"], f"اشتراك {o['plan_name']}", o["retail_price"], o["profit"], (o["at"] or "")[:16]] for o in ops]
+        raw += [[o["name"], o["username"], f"مبلغ سابق ({o['notes']})", o["amount"], 0, (o["at"] or "")[:16]] for o in olds]
+        raw.sort(key=lambda r: r[5], reverse=True)
+        headers = ["الاسم", "اليوزر", "النوع", "المبلغ", "الربح", "تاريخ الاستلام"]
+        totals = ["المجموع", f"{len({r[1] for r in raw})} مشترك", "", sum(r[3] for r in raw), sum(r[4] for r in raw), ""]
+        title, icon, note, dated = "المستلم منهم", "bi-cash-coin text-success", "منو انطاك فلوس، حسب تاريخ الاستلام.", True
+    elif kind == "unpaid":
+        ops = con.execute("""
+            SELECT s.name, s.username, s.phone, p.name AS plan_name, a.retail_price, a.operation_date AS at
+            FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
+            WHERE a.payment_type = 'من قبلي' AND a.self_collected_at IS NULL
+        """).fetchall()
+        olds = con.execute("""
+            SELECT s.name, s.username, s.phone, o.amount, o.notes, o.created_at AS at
+            FROM self_old o JOIN subscribers s ON s.id = o.subscriber_id WHERE o.collected_at IS NULL
+        """).fetchall()
+        raw = [[o["name"], o["username"], o["phone"], f"اشتراك {o['plan_name']}", o["retail_price"], o["at"][:10]] for o in ops]
+        raw += [[o["name"], o["username"], o["phone"], f"مبلغ سابق ({o['notes']})", o["amount"], o["at"][:10]] for o in olds]
+        raw.sort(key=lambda r: (r[0], r[5]))
+        headers = ["الاسم", "اليوزر", "الهاتف", "النوع", "المبلغ", "التاريخ"]
+        totals = ["المجموع", f"{len({r[1] for r in raw})} مشترك", "", "", sum(r[4] for r in raw), ""]
+        title, icon, note, dated = "الي ما مسددين بعد", "bi-hourglass-split text-warning", "كل المبالغ الي بذمتهم إلك.", False
+    else:
+        con.close()
+        return redirect(url_for("self_account"))
+    con.close()
+    if request.args.get("excel"):
+        return excel_response(title[:30], headers, raw, f"self_{kind}_{start}_{end}.xlsx", totals)
+    if kind == "received":
+        shown = [[esc(r[0]), f'<span dir="ltr">{esc(r[1])}</span>', esc(r[2]), money(r[3]), money(r[4]), esc(r[5])] for r in raw]
+        tshown = [totals[0], totals[1], "", money(totals[3]), money(totals[4]), ""]
+    else:
+        shown = [[esc(r[0]), f'<span dir="ltr">{esc(r[1])}</span>', f'<span dir="ltr">{esc(r[2])}</span>', esc(r[3]), money(r[4]), esc(r[5])] for r in raw]
+        tshown = [totals[0], totals[1], "", "", money(totals[4]), ""]
+    return report_page(title, icon, headers, shown, tshown, "self_report", kind, start, end, note,
+                       url_for("self_account"), dated)
 
 
 def excel_response(title, headers, rows, filename, totals=None):
