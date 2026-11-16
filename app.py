@@ -246,6 +246,10 @@ def init_db():
     if not column_exists(cur, "plans", "self_price"):
         cur.execute("ALTER TABLE plans ADD COLUMN self_price INTEGER")
 
+    # وقت دقيق لكل شحنة (حتى تقرير الشحنة يطلع اليوزرات الي انستلموا قبلها بالضبط)
+    if not column_exists(cur, "wallet_transactions", "marker"):
+        cur.execute("ALTER TABLE wallet_transactions ADD COLUMN marker TEXT")
+
     # self_only = مشترك خاص بحساب الدفع من قبلي (ما يطلع بالبرنامج الرئيسي)
     # self_name / self_phone = الاسم والهاتف المعدّلين بحساب الدفع من قبلي (ما يغيّرون الرئيسي)
     if not column_exists(cur, "subscribers", "self_only"):
@@ -1307,8 +1311,8 @@ def collection():
         ORDER BY a.settled_at DESC
     """, params).fetchall()
     charges = con.execute("""
-        SELECT amount, notes, created_at FROM wallet_transactions
-        WHERE transaction_type = 'شحن' ORDER BY id DESC LIMIT 20
+        SELECT id, amount, notes, created_at FROM wallet_transactions
+        WHERE transaction_type = 'شحن' ORDER BY id DESC LIMIT 50
     """).fetchall()
     balance = wallet_balance(con)
     con.close()
@@ -1332,6 +1336,8 @@ def collection():
             <td>{esc(c['created_at'][:16])}</td>
             <td class="text-success fw-bold">+{money(c['amount'])}</td>
             <td>{before(c['notes'])}</td>
+            <td class="text-nowrap"><a href="{url_for('charge_report', charge_id=c['id'])}" class="btn btn-sm btn-outline-primary"><i class="bi bi-receipt"></i> التقرير</a>
+                <a href="{url_for('charge_report', charge_id=c['id'], excel=1)}" class="btn btn-sm btn-outline-success" title="Excel"><i class="bi bi-file-earmark-excel"></i></a></td>
         </tr>""" for c in charges)
 
     body = f"""
@@ -1371,12 +1377,93 @@ def collection():
         <h5><i class="bi bi-clock-history text-secondary"></i> الشحنات السابقة</h5>
         <div class="table-responsive">
             <table class="table table-striped">
-                <thead><tr><th>وقت الشحن</th><th>مبلغ الشحن</th><th>التحصيل قبل الشحن</th></tr></thead>
-                <tbody>{charge_rows or '<tr><td colspan="3" class="text-muted text-center">ماكو شحنات</td></tr>'}</tbody>
+                <thead><tr><th>وقت الشحن</th><th>مبلغ الشحن</th><th>التحصيل قبل الشحن</th><th>اليوزرات</th></tr></thead>
+                <tbody>{charge_rows or '<tr><td colspan="4" class="text-muted text-center">ماكو شحنات</td></tr>'}</tbody>
             </table>
         </div>
     </div>
     """
+    return page(body)
+
+
+def charge_period(con, charge_id):
+    """فترة الشحنة: من الشحنة الي قبلها لحد هالشحنة. يرجع (الشحنة، البداية، النهاية)."""
+    ch = con.execute("SELECT * FROM wallet_transactions WHERE id = ? AND transaction_type = 'شحن'",
+                     (charge_id,)).fetchone()
+    if not ch:
+        return None, None, None
+    prev = con.execute("""
+        SELECT * FROM wallet_transactions WHERE transaction_type = 'شحن' AND id < ? ORDER BY id DESC LIMIT 1
+    """, (charge_id,)).fetchone()
+    end = ch["marker"] or ch["created_at"] + ".999999"
+    start = (prev["marker"] or prev["created_at"]) if prev else None
+    return ch, start, end
+
+
+@app.route("/collection/charge/<int:charge_id>")
+@login_required
+def charge_report(charge_id):
+    """تقرير شحنة: اليوزرات الي استلمت منهم قبل هالشحنة (من الشحنة السابقة)."""
+    con = db()
+    ch, start, end = charge_period(con, charge_id)
+    if not ch:
+        con.close()
+        flash("الشحنة غير موجودة", "danger")
+        return redirect(url_for("collection"))
+    cond, params = "a.settled_at < ?", [end]
+    if start:
+        cond += " AND a.settled_at >= ?"
+        params.append(start)
+    rows = con.execute(f"""
+        SELECT {SELF_NAME} AS sname, s.name, s.username, s.phone, p.name AS plan_name,
+               a.retail_price, a.profit, a.payment_type, a.operation_date, a.settled_at
+        FROM activations a JOIN subscribers s ON s.id = a.subscriber_id JOIN plans p ON p.id = a.plan_id
+        WHERE a.payment_type IN ('نقد', 'من قبلي') AND a.settled_at IS NOT NULL AND s.self_only = 0 AND {cond}
+        ORDER BY a.settled_at
+    """, params).fetchall()
+    con.close()
+    title = f"تقرير شحنة {ch['created_at'][:16]}"
+    headers = ["الاسم", "اليوزر", "الهاتف", "الباقة", "المبلغ", "الدفع", "الربح", "وقت الاستلام"]
+    raw = [[r["name"], r["username"], r["phone"], r["plan_name"], r["retail_price"], r["payment_type"],
+            r["profit"] if r["payment_type"] == PAY_CASH else 0, (r["settled_at"] or "")[:16]] for r in rows]
+    cash = sum(r[4] for r in raw if r[5] == PAY_CASH)
+    mine = sum(r[4] for r in raw if r[5] == PAY_SELF)
+    totals = ["المجموع", f"{len(raw)} يوزر", "", "", cash + mine, "", sum(r[6] for r in raw), ""]
+    if request.args.get("excel"):
+        return excel_response("تقرير الشحنة", headers, raw, f"charge_{ch['created_at'][:10]}_{charge_id}.xlsx", totals)
+
+    table = "".join(f"""
+        <tr>
+            <td class="fw-bold">{esc(r[0])}</td><td dir="ltr">{esc(r[1])}</td><td dir="ltr">{esc(r[2])}</td>
+            <td>{esc(r[3])}</td><td class="fw-bold">{money(r[4])}</td><td>{payment_badge(r[5])}</td>
+            <td class="text-success">{money(r[6]) if r[5] == PAY_CASH else '—'}</td><td>{esc(r[7])}</td>
+        </tr>""" for r in raw)
+    body = f"""
+    <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+        <h2 class="mb-0"><i class="bi bi-receipt text-primary"></i> {esc(title)}</h2>
+        <div class="d-flex gap-2 no-print">
+            <a href="{url_for('charge_report', charge_id=charge_id, excel=1)}" class="btn btn-success"><i class="bi bi-file-earmark-excel"></i> Excel</a>
+            <button onclick="window.print()" class="btn btn-outline-secondary"><i class="bi bi-printer"></i></button>
+            <a href="{url_for('collection')}" class="btn btn-outline-secondary">رجوع</a>
+        </div>
+    </div>
+    <div class="row g-3 mb-3">
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>مبلغ الشحنة</h6><h3 class="text-primary">{money(ch['amount'])}</h3></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>المحصّل قبلها</h6><h3>{money(cash + mine)}</h3>
+            <small class="text-muted">{len(raw)} يوزر</small></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>نقد / من قبلي</h6>
+            <h5 class="mb-0"><span class="text-success">{money(cash)}</span> / <span class="text-info">{money(mine)}</span></h5></div></div>
+        <div class="col-6 col-md-3"><div class="card stat-card p-3"><h6>الربح</h6><h3 class="text-success">{money(totals[6])}</h3></div></div>
+    </div>
+    <p class="text-muted small">الفترة: من {esc((start or 'البداية')[:16])} لحد الشحنة ({esc(ch['created_at'][:16])}).</p>
+    <div class="card p-4">
+        <div class="table-responsive">
+            <table class="table table-striped">
+                <thead><tr>{''.join(f'<th>{h}</th>' for h in headers)}</tr></thead>
+                <tbody>{table or '<tr><td colspan="8" class="text-muted text-center">ما استلمت من أحد بهالفترة</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>"""
     return page(body)
 
 
@@ -1403,12 +1490,13 @@ def wallet():
         before = collection_since_charge(con)[0]["collected"] if kind == "شحن" else 0
         if kind == "شحن":
             notes = (notes + " — " if notes else "") + f"التحصيل قبل الشحن: {money(before)}"
+        marker = precise_now()
         con.execute("""
-            INSERT INTO wallet_transactions (transaction_type, amount, notes, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (kind, amount, notes or "خصم يدوي", now_str()))
+            INSERT INTO wallet_transactions (transaction_type, amount, notes, created_at, marker)
+            VALUES (?, ?, ?, ?, ?)
+        """, (kind, amount, notes or "خصم يدوي", now_str(), marker if kind == "شحن" else None))
         if kind == "شحن":
-            set_setting(con, "collection_reset_at", precise_now())
+            set_setting(con, "collection_reset_at", marker)
         con.commit()
         con.close()
 
@@ -1431,7 +1519,8 @@ def wallet():
         <tr>
             <td>{esc(item['transaction_type'])}</td>
             <td class="{'text-success' if charge else 'text-danger'}">{'+' if charge else '-'}{money(item['amount'])}</td>
-            <td>{esc(item['notes'])}</td>
+            <td>{esc(item['notes'])}
+                {f'<a href="{url_for("charge_report", charge_id=item["id"])}" class="btn btn-sm btn-outline-primary ms-1"><i class="bi bi-receipt"></i> اليوزرات</a>' if charge else ''}</td>
             <td>{esc(item['created_at'])}</td>
         </tr>"""
 
